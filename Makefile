@@ -33,7 +33,11 @@ help:
 	@echo "  make test-release     - Full local simulation of the release flow"
 	@echo ""
 	@echo "$(GREEN)Publish (real):$(NC)"
-	@echo "  make publish-crates   - Publish to crates.io (prompts for confirmation)"
+	@echo "  make release VERSION=<patch|minor|major|x.y.z>"
+	@echo "                       - Bump Cargo.toml, commit, tag, push (CI does the rest)"
+	@echo "  make release-dry VERSION=<...>"
+	@echo "                       - cargo release dry-run"
+	@echo "  make publish-crates   - Publish to crates.io directly (skips bump+tag)"
 	@echo "  make publish-homebrew - Update Formula/cekanje.rb and push"
 	@echo ""
 	@echo "$(GREEN)Utilities:$(NC)"
@@ -109,6 +113,30 @@ publish-homebrew: check-env
 	@echo "$(YELLOW)⚠ Updating Homebrew formula for real$(NC)"
 	@read -p "Are you sure? (y/N) " -n 1 -r; echo; \
 	if [[ $$REPLY =~ ^[Yy]$$ ]]; then ./scripts/publish_homebrew.sh; else echo "$(YELLOW)Cancelled$(NC)"; fi
+
+.PHONY: release
+release:
+	@if [ -z "$(VERSION)" ]; then \
+		echo "Usage: make release VERSION=<patch|minor|major|x.y.z>"; \
+		echo ""; \
+		echo "Examples:"; \
+		echo "  make release VERSION=patch    # 0.1.0 -> 0.1.1"; \
+		echo "  make release VERSION=minor    # 0.1.0 -> 0.2.0"; \
+		echo "  make release VERSION=0.2.0    # explicit"; \
+		echo ""; \
+		echo "Requires: cargo-release (cargo install cargo-release), HEAD on main."; \
+		exit 1; \
+	fi
+	@if ! command -v cargo-release >/dev/null; then \
+		echo "$(RED)cargo-release not installed. Run: cargo install cargo-release$(NC)"; \
+		exit 1; \
+	fi
+	cargo release $(VERSION) --execute
+
+.PHONY: release-dry
+release-dry:
+	@if [ -z "$(VERSION)" ]; then echo "Usage: make release-dry VERSION=<patch|minor|major|x.y.z>"; exit 1; fi
+	cargo release $(VERSION)
 
 .PHONY: clean
 clean:
