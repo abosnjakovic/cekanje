@@ -140,6 +140,10 @@ make test         # cargo test
 make test-release # full local simulation of the release flow
 ```
 
+## Verification
+
+After install, walk through [docs/SMOKE.md](docs/SMOKE.md) — daemon up, single session, idle → notification, popup picker, focus-clear, idle shutdown.
+
 Release flow runs as `.github/workflows/release.yml` on tag push (`v*`). It builds for aarch64-apple-darwin, x86_64-apple-darwin, and x86_64-unknown-linux-gnu, uploads tarballs to the release, regenerates `Formula/cekanje.rb` with fresh SHA256s, and publishes to crates.io. Required repo secrets: `CRATES_IO_TOKEN`, `HOMEBREW_TAP_TOKEN`.
 
 ## Limitations / TODO
