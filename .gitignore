@@ -1,5 +1,2 @@
 /target
-**/*.rs.bk
-*.pdb
-.DS_Store
-scripts/.env
+/scripts/.env
