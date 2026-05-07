@@ -1,16 +1,22 @@
 class Cekanje < Formula
   desc "tmux notifier daemon for Claude Code sessions"
   homepage "https://github.com/abosnjakovic/cekanje"
-  version "0.1.0"
+  version "0.1.1"
+  license "MIT"
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/abosnjakovic/cekanje/releases/download/v0.1.0/cekanje-0.1.0-aarch64-apple-darwin.tar.gz"
-      sha256 "af20ccb3d61f75df18dbf30681baa5eb205906eaed516cef1cf0acf1f7db6513"
+      url "https://github.com/abosnjakovic/cekanje/releases/download/v0.1.1/cekanje-0.1.1-aarch64-apple-darwin.tar.gz"
+      sha256 "65abbcf24e7e50913dada018d3131eb347680bf003bea45b1d62ee439ba7fa00"
     else
-      url "https://github.com/abosnjakovic/cekanje/releases/download/v0.1.0/cekanje-0.1.0-x86_64-apple-darwin.tar.gz"
-      sha256 "cafebe9095a3a27b64d2ae24a4fa9ec35a97282409c37237152dcd87006c4d17"
+      url "https://github.com/abosnjakovic/cekanje/releases/download/v0.1.1/cekanje-0.1.1-x86_64-apple-darwin.tar.gz"
+      sha256 "7c009506f07dc1d1fbadacdde44fba6e01c98f6c7b03016dd0a57e8dbb0eda50"
     end
+  end
+
+  on_linux do
+    url "https://github.com/abosnjakovic/cekanje/releases/download/v0.1.1/cekanje-0.1.1-x86_64-unknown-linux-gnu.tar.gz"
+    sha256 "eadfa5bc52c73d38d24ed82e42f68f094fcc795010cba549a10f6e27f6faedb1"
   end
 
   def install
@@ -19,6 +25,6 @@ class Cekanje < Formula
   end
 
   test do
-    system "#{bin}/cekanje", "--version"
+    assert_match version.to_s, shell_output("#{bin}/cekanje --version")
   end
 end
