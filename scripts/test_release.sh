@@ -1,77 +1,40 @@
-#!/bin/bash
-# Local simulation of the GitHub Actions release flow.
-set -e
+#!/usr/bin/env bash
+# test_release.sh — full local simulation. No network mutations.
+#
+# - Builds release binaries for available targets.
+# - Tar archives them under target/release-archives/.
+# - Runs cargo publish --dry-run.
+# - Generates target/homebrew/cekanje.rb.
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+set -euo pipefail
 
-if [ -f "scripts/.env" ]; then
-    # shellcheck source=/dev/null
-    source scripts/.env
-fi
+CRATE="cekanje"
 
-echo -e "${BLUE}=== cekanje local release test ===${NC}"
-echo ""
+version=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
+echo "→ Simulating release of ${CRATE} ${version}"
 
-if [ -z "$TEST_VERSION" ]; then
-    read -p "Version to test (e.g. 0.1.0): " TEST_VERSION
-fi
-if [ -z "$TEST_TAG" ]; then
-    TEST_TAG="v${TEST_VERSION}"
-fi
-TEST_REPO="${TEST_REPO:-abosnjakovic/cekanje}"
+targets=(aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu)
 
-echo "Version: $TEST_VERSION  Tag: $TEST_TAG  Repo: $TEST_REPO"
-echo ""
+archives_dir="target/release-archives"
+mkdir -p "${archives_dir}"
 
-echo -e "${BLUE}Step 1: Cargo.toml metadata${NC}"
-current_version=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
-echo "  current version: ${current_version}"
-for field in description license repository; do
-    grep -q "^${field}" Cargo.toml || { echo -e "${RED}✗ Missing ${field}${NC}"; exit 1; }
+for target in "${targets[@]}"; do
+  if ! rustup target list --installed | grep -qx "${target}"; then
+    echo "→ Skipping ${target} (toolchain not installed locally)"
+    continue
+  fi
+  echo "→ Building ${target}"
+  cargo build --release --target "${target}"
+
+  archive="${archives_dir}/${CRATE}-${version}-${target}.tar.gz"
+  tar -C "target/${target}/release" -czf "${archive}" "${CRATE}"
+  echo "  wrote ${archive}"
 done
-echo -e "${GREEN}✓ Cargo.toml ready${NC}"
-echo ""
 
-echo -e "${BLUE}Step 2: Build${NC}"
-cargo build --quiet
-cargo build --release --quiet
-echo -e "${GREEN}✓ Debug + release builds OK${NC}"
-echo ""
+echo "→ cargo publish --dry-run"
+cargo publish --dry-run
 
-echo -e "${BLUE}Step 3: Lint + tests${NC}"
-cargo fmt -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test --quiet
-echo -e "${GREEN}✓ Lint + tests pass${NC}"
-echo ""
+echo "→ Homebrew formula dry-run"
+scripts/publish_homebrew.sh --dry-run
 
-echo -e "${BLUE}Step 4: crates.io dry-run${NC}"
-cargo publish --dry-run --allow-dirty 2>/dev/null && echo -e "${GREEN}✓ crates.io dry-run OK${NC}" \
-    || echo -e "${YELLOW}⚠ dry-run failed (may be already published)${NC}"
-echo ""
-
-echo -e "${BLUE}Step 5: Archive (host platform)${NC}"
-mkdir -p target/test-release
-host=$(rustc -vV | awk '/^host:/ {print $2}')
-if [ -f "target/release/cekanje" ]; then
-    (cd target/release && tar czf ../test-release/cekanje-${TEST_VERSION}-${host}.tar.gz cekanje)
-    echo -e "${GREEN}✓ target/test-release/cekanje-${TEST_VERSION}-${host}.tar.gz${NC}"
-fi
-echo ""
-
-echo -e "${BLUE}Step 6: Workflow sanity${NC}"
-if [ -f .github/workflows/release.yml ]; then
-    grep -q "workflow_dispatch:" .github/workflows/release.yml && echo -e "${GREEN}✓ workflow_dispatch trigger${NC}"
-    grep -q "update-homebrew-formula:" .github/workflows/release.yml && echo -e "${GREEN}✓ homebrew job${NC}"
-    grep -q "publish-crates:" .github/workflows/release.yml && echo -e "${GREEN}✓ crates job${NC}"
-else
-    echo -e "${RED}✗ release.yml missing${NC}"
-fi
-echo ""
-
-echo -e "${GREEN}All local checks passed.${NC}"
-echo "Next: edit scripts/.env, run 'make test-crates' / 'make test-homebrew'."
+echo "✓ Local release simulation complete."

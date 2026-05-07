@@ -6,18 +6,9 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
-      version:
-        description: 'Release version (e.g., 0.1.0)'
+      tag:
+        description: "Existing tag to (re)release, e.g. v0.1.1"
         required: true
-        type: string
-      create_new_release:
-        description: 'Create new GitHub release'
-        required: true
-        type: boolean
-        default: true
-      release_tag:
-        description: 'Tag name for release (defaults to v{version})'
-        required: false
         type: string
 
 env:
@@ -28,73 +19,75 @@ permissions:
 
 jobs:
   create-release:
-    name: Create Release
+    name: Create GitHub Release
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.get_version.outputs.version }}
-      tag: ${{ steps.get_version.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
     steps:
-      - name: Get version from tag or input
-        id: get_version
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          INPUT_VERSION: ${{ github.event.inputs.version }}
-          INPUT_TAG: ${{ github.event.inputs.release_tag }}
-          GITHUB_REF_NAME: ${{ github.ref_name }}
-        run: |
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            version="$INPUT_VERSION"
-            tag="${INPUT_TAG:-v$INPUT_VERSION}"
-          else
-            version="${GITHUB_REF_NAME#v}"
-            tag="$GITHUB_REF_NAME"
-          fi
-          {
-            echo "version=$version"
-            echo "tag=$tag"
-          } >> "$GITHUB_OUTPUT"
-          echo "Version: $version, Tag: $tag"
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
 
-      - name: Create Release
-        if: github.event_name == 'push' || github.event.inputs.create_new_release == 'true'
+      - name: Resolve version + tag
+        id: meta
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          tag="${INPUT_TAG:-$REF_NAME}"
+          version="${tag#v}"
+          echo "tag=${tag}"         >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Create release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          VERSION: ${{ steps.get_version.outputs.version }}
-          TAG: ${{ steps.get_version.outputs.tag }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
         run: |
-          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-            echo "Release $TAG already exists, skipping creation"
+          if gh release view "${TAG}" --repo "${REPO}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists; skipping create."
             exit 0
           fi
 
-          notes="Release $VERSION
+          gh release create "${TAG}" \
+            --repo "${REPO}" \
+            --title "Release ${TAG}" \
+            --notes "Release ${VERSION}
 
           ## Installation
 
-          ### Homebrew (macOS)
-          \`\`\`
-          brew tap $REPO https://github.com/$REPO
+          ### Homebrew
+          \`\`\`bash
+          brew tap ${REPO} https://github.com/${REPO}
           brew install cekanje
           \`\`\`
 
-          ### cargo
-          \`\`\`
+          ### Cargo
+          \`\`\`bash
           cargo install cekanje
           \`\`\`
 
-          ### Pre-built binaries
-          See assets below."
+          ### macOS (Apple Silicon)
+          \`\`\`bash
+          curl -L \"https://github.com/${REPO}/releases/download/${TAG}/cekanje-${VERSION}-aarch64-apple-darwin.tar.gz\" | tar xz
+          \`\`\`
 
-          gh release create "$TAG" \
-            --repo "$REPO" \
-            --title "Release $TAG" \
-            --notes "$notes" \
-            --draft=false \
-            --prerelease=false
+          ### macOS (Intel)
+          \`\`\`bash
+          curl -L \"https://github.com/${REPO}/releases/download/${TAG}/cekanje-${VERSION}-x86_64-apple-darwin.tar.gz\" | tar xz
+          \`\`\`
+
+          ### Linux (x86_64)
+          \`\`\`bash
+          curl -L \"https://github.com/${REPO}/releases/download/${TAG}/cekanje-${VERSION}-x86_64-unknown-linux-gnu.tar.gz\" | tar xz
+          \`\`\`"
 
   build-release:
-    name: Build Release
+    name: Build ${{ matrix.target }}
     needs: create-release
     runs-on: ${{ matrix.os }}
     strategy:
@@ -103,17 +96,15 @@ jobs:
         include:
           - os: macos-latest
             target: aarch64-apple-darwin
-            suffix: aarch64-apple-darwin
           - os: macos-15-intel
             target: x86_64-apple-darwin
-            suffix: x86_64-apple-darwin
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            suffix: x86_64-unknown-linux-gnu
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.create-release.outputs.tag }}
 
       - name: Install Linux build deps
         if: runner.os == 'Linux'
@@ -128,32 +119,35 @@ jobs:
           target: ${{ matrix.target }}
 
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --target "${TARGET}"
+
+      - name: Smoke test --version
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.create-release.outputs.version }}
+        run: |
+          out=$("./target/${TARGET}/release/cekanje" --version)
+          echo "${out}"
+          echo "${out}" | grep -F "${VERSION}"
 
       - name: Create archive
         env:
-          VERSION: ${{ needs.create-release.outputs.version }}
-          SUFFIX: ${{ matrix.suffix }}
           TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.create-release.outputs.version }}
         run: |
-          cd "target/$TARGET/release"
-          archive="cekanje-$VERSION-$SUFFIX.tar.gz"
-          tar czf "$archive" cekanje
-          ls -la "$archive"
+          archive="cekanje-${VERSION}-${TARGET}.tar.gz"
+          tar -C "target/${TARGET}/release" -czf "${archive}" cekanje
+          ls -la "${archive}"
+          echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
-      - name: Upload Release Asset
+      - name: Upload release asset
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          VERSION: ${{ needs.create-release.outputs.version }}
-          SUFFIX: ${{ matrix.suffix }}
-          TARGET: ${{ matrix.target }}
           TAG: ${{ needs.create-release.outputs.tag }}
-        run: |
-          archive="cekanje-$VERSION-$SUFFIX.tar.gz"
-          gh release upload "$TAG" \
-            --repo "$REPO" \
-            "target/$TARGET/release/$archive"
+        run: gh release upload "${TAG}" --repo "${REPO}" "${ARCHIVE}"
 
   update-homebrew-formula:
     name: Update Homebrew Formula
@@ -162,48 +156,58 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          ref: main
+          fetch-depth: 0
 
-      - name: Calculate SHA256 hashes
-        id: sha256
+      - name: Compute SHA256 hashes
+        id: sha
         env:
           REPO: ${{ github.repository }}
-          VERSION: ${{ needs.create-release.outputs.version }}
           TAG: ${{ needs.create-release.outputs.tag }}
+          VERSION: ${{ needs.create-release.outputs.version }}
         run: |
-          aarch64_url="https://github.com/$REPO/releases/download/$TAG/cekanje-$VERSION-aarch64-apple-darwin.tar.gz"
-          aarch64_sha256=$(curl -sL "$aarch64_url" | sha256sum | cut -d' ' -f1)
-          x86_url="https://github.com/$REPO/releases/download/$TAG/cekanje-$VERSION-x86_64-apple-darwin.tar.gz"
-          x86_sha256=$(curl -sL "$x86_url" | sha256sum | cut -d' ' -f1)
-          {
-            echo "aarch64_sha256=$aarch64_sha256"
-            echo "x86_sha256=$x86_sha256"
-          } >> "$GITHUB_OUTPUT"
-          echo "Apple Silicon: $aarch64_sha256"
-          echo "Intel:         $x86_sha256"
+          base="https://github.com/${REPO}/releases/download/${TAG}"
 
-      - name: Generate and commit Homebrew Formula
+          aarch64_mac=$(curl -fsSL "${base}/cekanje-${VERSION}-aarch64-apple-darwin.tar.gz" | sha256sum | cut -d' ' -f1)
+          x86_mac=$(curl     -fsSL "${base}/cekanje-${VERSION}-x86_64-apple-darwin.tar.gz"  | sha256sum | cut -d' ' -f1)
+          x86_linux=$(curl   -fsSL "${base}/cekanje-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" | sha256sum | cut -d' ' -f1)
+
+          echo "aarch64_mac=${aarch64_mac}" >> "$GITHUB_OUTPUT"
+          echo "x86_mac=${x86_mac}"         >> "$GITHUB_OUTPUT"
+          echo "x86_linux=${x86_linux}"     >> "$GITHUB_OUTPUT"
+
+      - name: Regenerate Formula/cekanje.rb
         env:
-          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           REPO: ${{ github.repository }}
-          VERSION: ${{ needs.create-release.outputs.version }}
           TAG: ${{ needs.create-release.outputs.tag }}
-          AARCH64_SHA: ${{ steps.sha256.outputs.aarch64_sha256 }}
-          X86_SHA: ${{ steps.sha256.outputs.x86_sha256 }}
+          VERSION: ${{ needs.create-release.outputs.version }}
+          AARCH64_MAC_SHA: ${{ steps.sha.outputs.aarch64_mac }}
+          X86_MAC_SHA: ${{ steps.sha.outputs.x86_mac }}
+          X86_LINUX_SHA: ${{ steps.sha.outputs.x86_linux }}
         run: |
-          cat > /tmp/cekanje.rb << EOF
+          mkdir -p Formula
+          cat > Formula/cekanje.rb <<EOF
           class Cekanje < Formula
             desc "tmux notifier daemon for Claude Code sessions"
-            homepage "https://github.com/$REPO"
-            version "$VERSION"
+            homepage "https://github.com/${REPO}"
+            version "${VERSION}"
+            license "MIT"
 
             on_macos do
               if Hardware::CPU.arm?
-                url "https://github.com/$REPO/releases/download/$TAG/cekanje-$VERSION-aarch64-apple-darwin.tar.gz"
-                sha256 "$AARCH64_SHA"
+                url "https://github.com/${REPO}/releases/download/${TAG}/cekanje-${VERSION}-aarch64-apple-darwin.tar.gz"
+                sha256 "${AARCH64_MAC_SHA}"
               else
-                url "https://github.com/$REPO/releases/download/$TAG/cekanje-$VERSION-x86_64-apple-darwin.tar.gz"
-                sha256 "$X86_SHA"
+                url "https://github.com/${REPO}/releases/download/${TAG}/cekanje-${VERSION}-x86_64-apple-darwin.tar.gz"
+                sha256 "${X86_MAC_SHA}"
               end
+            end
+
+            on_linux do
+              url "https://github.com/${REPO}/releases/download/${TAG}/cekanje-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+              sha256 "${X86_LINUX_SHA}"
             end
 
             def install
@@ -212,27 +216,37 @@ jobs:
             end
 
             test do
-              system "#{bin}/cekanje", "--version"
+              assert_match version.to_s, shell_output("#{bin}/cekanje --version")
             end
           end
           EOF
 
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          echo "Generated formula:"
+          cat Formula/cekanje.rb
 
-          main_repo_url="https://x-access-token:$HOMEBREW_TAP_TOKEN@github.com/$REPO.git"
-          git clone "$main_repo_url" main-repo
-          cd main-repo
-          mkdir -p Formula
-          cp /tmp/cekanje.rb Formula/cekanje.rb
+      - name: Commit and push
+        env:
+          VERSION: ${{ needs.create-release.outputs.version }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add Formula/cekanje.rb
           if git diff --staged --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "Update cekanje formula to $VERSION"
-            git push origin main
+            echo "No formula changes."
+            exit 0
           fi
+          git commit -m "chore: update homebrew formula to ${VERSION}"
+
+          for i in 1 2 3; do
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            echo "Push rejected; rebasing and retrying ($i/3)…"
+            git pull --rebase origin main
+          done
+          echo "Push failed after retries." >&2
+          exit 1
 
   publish-crates:
     name: Publish to crates.io
@@ -241,6 +255,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.create-release.outputs.tag }}
 
       - name: Install Linux build deps
         run: |
@@ -252,7 +268,7 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Publish to crates.io
+      - name: Publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
-        run: cargo publish --allow-dirty
+        run: cargo publish
