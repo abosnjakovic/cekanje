@@ -1,0 +1,28 @@
+# Configuration for `cargo release` (https://github.com/crate-ci/cargo-release).
+#
+# Flow when you run `cargo release patch --execute` (or minor / major / x.y.z):
+#   1. Bump version in Cargo.toml + Cargo.lock
+#   2. Commit "chore: release v<new>"
+#   3. Annotated tag v<new>
+#   4. Push commit + tag to origin
+#   5. CI's release.yml fires on the tag → builds binaries, uploads tarballs,
+#      regenerates Formula/cekanje.rb, runs `cargo publish`.
+
+# CI does the actual `cargo publish` — don't double-publish locally.
+publish = false
+
+# Only run from main; refuse from feature branches.
+# If you use the gitbutler workspace, run `but teardown` first
+# (or `git switch main`) so HEAD is on the real branch before releasing.
+allow-branch = ["main"]
+
+# Tag name (default `v{{version}}` already; explicit for clarity).
+tag-name = "v{{version}}"
+
+# Commit + tag messages.
+pre-release-commit-message = "chore: release v{{version}}"
+tag-message = "v{{version}}"
+
+# Don't ask cargo-release to sign — defer to the user's git/gpg config.
+sign-commit = false
+sign-tag = false

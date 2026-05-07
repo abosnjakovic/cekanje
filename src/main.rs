@@ -8,7 +8,11 @@ mod state;
 mod tmux;
 
 #[derive(Parser)]
-#[command(name = "cekanje", about = "tmux notifier daemon for Claude sessions")]
+#[command(
+    name = "cekanje",
+    about = "tmux notifier daemon for Claude sessions",
+    version
+)]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
@@ -61,7 +65,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     match Cli::parse().command {
-        Cmd::Serve { port, ensure, idle_secs } => {
+        Cmd::Serve {
+            port,
+            ensure,
+            idle_secs,
+        } => {
             if ensure {
                 if client::http_get(port, "/status").await.is_ok() {
                     return Ok(());

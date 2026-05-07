@@ -147,10 +147,10 @@ impl State {
 
     /// Drop a session entirely (SessionEnd).
     pub fn drop_session(&mut self, session_id: &str) {
-        if let Some(s) = self.sessions.remove(session_id) {
-            if let Some(loc) = s.tmux {
-                self.by_pane.remove(&loc.pane);
-            }
+        if let Some(s) = self.sessions.remove(session_id)
+            && let Some(loc) = s.tmux
+        {
+            self.by_pane.remove(&loc.pane);
         }
     }
 
