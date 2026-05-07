@@ -1,6 +1,6 @@
 [package]
 name = "cekanje"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "tmux notifier daemon for Claude Code sessions: track every active session, surface a native popup when one needs attention, jump to its pane via fzf"
 license = "MIT"
