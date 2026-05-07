@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 mod client;
 mod menu;
 mod notify;
+mod rebuild;
 mod serve;
 mod state;
 mod tmux;
@@ -31,6 +32,10 @@ enum Cmd {
         /// Self-exit after this many seconds with zero registered sessions. 0 disables.
         #[arg(long, default_value_t = 1800)]
         idle_secs: u64,
+        /// On startup, scan ~/.claude/projects/ for transcripts modified within
+        /// this many seconds and pre-populate sessions as Working. 0 disables.
+        #[arg(long, default_value_t = 300)]
+        rebuild_window_secs: u64,
     },
     /// Print the tmux status-bar badge text (empty when no sessions are waiting)
     Status {
@@ -69,15 +74,16 @@ async fn main() -> anyhow::Result<()> {
             port,
             ensure,
             idle_secs,
+            rebuild_window_secs,
         } => {
             if ensure {
                 if client::http_get(port, "/status").await.is_ok() {
                     return Ok(());
                 }
-                spawn_detached(port, idle_secs)?;
+                spawn_detached(port, idle_secs, rebuild_window_secs)?;
                 return Ok(());
             }
-            serve::run(port, idle_secs).await
+            serve::run(port, idle_secs, rebuild_window_secs).await
         }
         Cmd::Status { port } => {
             let body = client::http_get(port, "/status").await.unwrap_or_default();
@@ -98,14 +104,17 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-fn spawn_detached(port: u16, idle_secs: u64) -> anyhow::Result<()> {
+fn spawn_detached(port: u16, idle_secs: u64, rebuild_window_secs: u64) -> anyhow::Result<()> {
     use std::process::{Command, Stdio};
     let exe = std::env::current_exe()?;
     Command::new(exe)
-        .args(["serve", "--port"])
+        .arg("serve")
+        .arg("--port")
         .arg(port.to_string())
         .arg("--idle-secs")
         .arg(idle_secs.to_string())
+        .arg("--rebuild-window-secs")
+        .arg(rebuild_window_secs.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

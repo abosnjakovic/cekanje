@@ -39,7 +39,7 @@ Multiple parallel Claude sessions across tmux windows are easy to lose track of.
 
 | | |
 |---|---|
-| `cek serve [--port 8731] [--ensure] [--idle-secs 1800]` | Run daemon. `--ensure` no-ops if already up, otherwise spawns detached. `--idle-secs 0` disables auto-shutdown. |
+| `cek serve [--port 8731] [--ensure] [--idle-secs 1800] [--rebuild-window-secs 300]` | Run daemon. `--ensure` no-ops if already up, otherwise spawns detached. `--idle-secs 0` disables auto-shutdown. `--rebuild-window-secs 0` disables cold-start state rebuild from `~/.claude/projects/`. |
 | `cek status` | Print `⏳N` if any session is Waiting; empty otherwise. (For users with a tmux status bar.) |
 | `cek list` | Dump current state as JSON. |
 | `cek visit <pane>` | Mark the pane's session as visited. |
@@ -108,6 +108,30 @@ bind-key -n M-i run-shell 'tmux display-popup -E -w 80% -h 60% "cek menu"'
 Reload: `tmux source-file ~/.config/tmux/tmux.conf`. Then bootstrap once with `cek serve --ensure` (the `session-created` hook only fires for newly-opened tmux sessions).
 
 If you keep a tmux status bar, you can also add `set -ag status-right '#(cek status) '` plus `set -g status-interval 5`.
+
+## Configure systemd (Linux only)
+
+When you don't have tmux's `session-created` hook to bootstrap the daemon (or want it running independently), use the bundled user unit:
+
+```bash
+mkdir -p ~/.config/systemd/user
+install -m 0644 dist/systemd/cekanje.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now cekanje.service
+```
+
+Optional: `loginctl enable-linger $USER` so the daemon survives logout.
+
+The unit runs `cek serve --idle-secs 0` — systemd is the lifecycle manager, so the auto-idle-shutdown is off.
+
+## Cold-start rebuild
+
+On startup, the daemon scans `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl` and pre-populates sessions whose transcript files were modified inside the rebuild window (default 5 minutes). Each rebuilt session lands in **Working** state with no tmux pane bound; the next hook event from that session attaches its pane.
+
+Caveats:
+- The rebuild path never marks Waiting — transcript scraping for that signal is too brittle. `Notification` / `Stop` events from the live hook still fire correctly.
+- Path encoding is naive (`-` ↔ `/`). cwds containing literal `-` round-trip ambiguously, but won't crash.
+- Disable with `--rebuild-window-secs 0`. Widen with e.g. `--rebuild-window-secs 3600` to restore everything from the last hour.
 
 ## State machine
 

@@ -14,8 +14,19 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
 
-pub async fn run(port: u16, idle_secs: u64) -> anyhow::Result<()> {
+pub async fn run(port: u16, idle_secs: u64, rebuild_window_secs: u64) -> anyhow::Result<()> {
     let shared = state::new_shared();
+
+    if rebuild_window_secs > 0 {
+        let restored = crate::rebuild::rebuild(&shared, Duration::from_secs(rebuild_window_secs));
+        if restored > 0 {
+            info!(
+                restored,
+                window_secs = rebuild_window_secs,
+                "cold-start rebuild"
+            );
+        }
+    }
 
     if idle_secs > 0 {
         let s = Arc::clone(&shared);

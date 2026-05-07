@@ -1,0 +1,11 @@
+[Unit]
+Description=cekanje — tmux notifier daemon for Claude sessions
+After=network.target
+
+[Service]
+ExecStart=%h/.local/bin/cek serve --idle-secs 0
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
