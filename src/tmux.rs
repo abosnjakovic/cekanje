@@ -4,11 +4,7 @@ use std::process::Command;
 
 /// $TMUX is `<socket-path>,<pid>,<session>`. We want only the socket path.
 pub fn parse_socket(tmux_env: &str) -> String {
-    tmux_env
-        .split(',')
-        .next()
-        .unwrap_or(tmux_env)
-        .to_string()
+    tmux_env.split(',').next().unwrap_or(tmux_env).to_string()
 }
 
 /// Return active panes (one per attached client) on a given tmux server.

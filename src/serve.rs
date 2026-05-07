@@ -63,10 +63,7 @@ async fn event(
         return StatusCode::BAD_REQUEST;
     };
 
-    let cwd = body
-        .get("cwd")
-        .and_then(|v| v.as_str())
-        .map(PathBuf::from);
+    let cwd = body.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from);
     let message = body
         .get("message")
         .and_then(|v| v.as_str())
@@ -127,7 +124,11 @@ async fn event(
 
 async fn status(State(shared): State<Shared>) -> String {
     let n = shared.read().waiting_count();
-    if n == 0 { String::new() } else { format!("⏳{n}") }
+    if n == 0 {
+        String::new()
+    } else {
+        format!("⏳{n}")
+    }
 }
 
 async fn list(State(shared): State<Shared>) -> impl IntoResponse {
