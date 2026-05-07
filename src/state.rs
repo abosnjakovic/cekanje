@@ -186,3 +186,130 @@ impl State {
         out
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pane(p: &str) -> Option<TmuxLocation> {
+        Some(TmuxLocation {
+            pane: p.to_string(),
+            socket: None,
+        })
+    }
+
+    #[test]
+    fn upsert_working_creates_session_and_indexes_pane() {
+        let mut s = State::default();
+        s.upsert_working("S1".into(), Some("/tmp/a".into()), pane("%1"));
+
+        assert_eq!(s.sessions.len(), 1);
+        let session = &s.sessions["S1"];
+        assert_eq!(session.status, Status::Working);
+        assert_eq!(session.cwd.as_deref(), Some(std::path::Path::new("/tmp/a")));
+        assert_eq!(s.by_pane["%1"], "S1");
+    }
+
+    #[test]
+    fn upsert_working_flips_waiting_back_to_working() {
+        let mut s = State::default();
+        s.mark_waiting("S1".into(), None, pane("%1"), Some("hi".into()));
+        assert_eq!(s.sessions["S1"].status, Status::Waiting);
+        assert!(s.sessions["S1"].waiting_since.is_some());
+
+        s.upsert_working("S1".into(), None, pane("%1"));
+        assert_eq!(s.sessions["S1"].status, Status::Working);
+        assert!(s.sessions["S1"].waiting_since.is_none());
+    }
+
+    #[test]
+    fn mark_waiting_transitions_and_records_metadata() {
+        let mut s = State::default();
+        s.upsert_working("S1".into(), None, pane("%1"));
+
+        s.mark_waiting(
+            "S1".into(),
+            Some("/cwd".into()),
+            pane("%1"),
+            Some("msg".into()),
+        );
+        let session = &s.sessions["S1"];
+        assert_eq!(session.status, Status::Waiting);
+        assert_eq!(session.last_message.as_deref(), Some("msg"));
+        assert!(session.waiting_since.is_some());
+    }
+
+    #[test]
+    fn mark_waiting_keeps_previous_message_when_new_one_is_none() {
+        let mut s = State::default();
+        s.mark_waiting("S1".into(), None, pane("%1"), Some("first".into()));
+        s.mark_waiting("S1".into(), None, pane("%1"), None);
+        assert_eq!(s.sessions["S1"].last_message.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn drop_session_clears_both_indexes() {
+        let mut s = State::default();
+        s.upsert_working("S1".into(), None, pane("%1"));
+        s.drop_session("S1");
+        assert!(s.sessions.is_empty());
+        assert!(s.by_pane.is_empty());
+    }
+
+    #[test]
+    fn visit_pane_clears_only_when_waiting() {
+        let mut s = State::default();
+        s.upsert_working("S1".into(), None, pane("%1"));
+        // Working: visit returns false, no transition.
+        assert!(!s.visit_pane("%1"));
+        assert_eq!(s.sessions["S1"].status, Status::Working);
+
+        // Waiting: visit returns true, flips to Working.
+        s.mark_waiting("S1".into(), None, pane("%1"), None);
+        assert!(s.visit_pane("%1"));
+        assert_eq!(s.sessions["S1"].status, Status::Working);
+        assert!(s.sessions["S1"].waiting_since.is_none());
+    }
+
+    #[test]
+    fn visit_pane_returns_false_for_unknown_pane() {
+        let mut s = State::default();
+        s.upsert_working("S1".into(), None, pane("%1"));
+        assert!(!s.visit_pane("%99"));
+    }
+
+    #[test]
+    fn waiting_count_matches_waiting_sessions() {
+        let mut s = State::default();
+        s.upsert_working("A".into(), None, pane("%1"));
+        s.mark_waiting("B".into(), None, pane("%2"), None);
+        s.mark_waiting("C".into(), None, pane("%3"), None);
+        assert_eq!(s.waiting_count(), 2);
+    }
+
+    #[test]
+    fn is_idle_only_when_empty_and_threshold_elapsed() {
+        let mut s = State::default();
+        // Empty + zero threshold = idle.
+        assert!(s.is_idle(Duration::from_millis(0)));
+
+        // Non-empty: never idle, regardless of threshold.
+        s.upsert_working("A".into(), None, pane("%1"));
+        assert!(!s.is_idle(Duration::from_millis(0)));
+
+        // Empty again but with a long threshold = not idle.
+        s.drop_session("A");
+        assert!(!s.is_idle(Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn snapshot_orders_waiting_first() {
+        let mut s = State::default();
+        s.upsert_working("working".into(), None, pane("%1"));
+        s.mark_waiting("waiting".into(), None, pane("%2"), None);
+        let snap = s.snapshot();
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap[0].session_id, "waiting");
+        assert_eq!(snap[1].session_id, "working");
+    }
+}
