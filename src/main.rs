@@ -4,11 +4,13 @@ mod client;
 mod menu;
 mod notify;
 mod persist;
+mod preview;
 mod rebuild;
 mod restore;
 mod serve;
 mod state;
 mod tmux;
+mod transcript;
 
 #[derive(Parser)]
 #[command(
@@ -60,6 +62,13 @@ enum Cmd {
         #[arg(long, default_value_t = 8731)]
         port: u16,
     },
+    /// Render an fzf preview block for the given session_id (used by `cek menu` internally)
+    #[command(hide = true)]
+    Preview {
+        session_id: String,
+        #[arg(long, default_value_t = 8731)]
+        port: u16,
+    },
 }
 
 #[tokio::main]
@@ -103,6 +112,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Menu { port } => menu::run(port).await,
+        Cmd::Preview { session_id, port } => preview::run(port, &session_id).await,
     }
 }
 
