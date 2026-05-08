@@ -56,6 +56,26 @@ pub fn display_message(socket: Option<&str>, pane: &str, fmt: &str) -> Result<St
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Capture the visible pane plus `scrollback_lines` of history. Returns the
+/// raw text. Errors are surfaced; callers may render an empty preview if the
+/// pane has gone away.
+pub fn capture_pane(socket: Option<&str>, pane: &str, scrollback_lines: u32) -> Result<String> {
+    let mut cmd = Command::new("tmux");
+    if let Some(s) = socket {
+        cmd.arg("-S").arg(s);
+    }
+    let scrollback = format!("-{scrollback_lines}");
+    cmd.args(["capture-pane", "-p", "-t", pane, "-S", &scrollback]);
+    let out = cmd.output().context("tmux capture-pane")?;
+    if !out.status.success() {
+        bail!(
+            "tmux capture-pane failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// Verify a pane id still resolves on the given tmux server.
 pub fn pane_alive(socket: Option<&str>, pane: &str) -> bool {
     display_message(socket, pane, "#{pane_id}").is_ok()
