@@ -1,3 +1,5 @@
+use crate::persist;
+use crate::restore;
 use crate::state::{self, Shared, TmuxLocation};
 use crate::tmux;
 use axum::{
@@ -10,23 +12,35 @@ use axum::{
 use serde::Deserialize;
 use serde_json::Value;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tracing::{info, warn};
 
+static PERSIST_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Atomic write of the current state to disk if a persist path is configured.
+/// Errors are logged but never propagated — a failed persist must not block
+/// processing of the hook event.
+fn persist_now(shared: &Shared) {
+    let Some(Some(path)) = PERSIST_PATH.get() else {
+        return;
+    };
+    let snap = shared.read();
+    if let Err(e) = persist::save(path, &snap) {
+        warn!(path = %path.display(), error = %e, "persist failed");
+    }
+}
+
 pub async fn run(port: u16, idle_secs: u64, rebuild_window_secs: u64) -> anyhow::Result<()> {
     let shared = state::new_shared();
+    let persist_path = persist::default_path();
+    let _ = PERSIST_PATH.set(persist_path.clone());
 
-    if rebuild_window_secs > 0 {
-        let restored = crate::rebuild::rebuild(&shared, Duration::from_secs(rebuild_window_secs));
-        if restored > 0 {
-            info!(
-                restored,
-                window_secs = rebuild_window_secs,
-                "cold-start rebuild"
-            );
-        }
-    }
+    restore::restore(
+        &shared,
+        persist_path.as_deref(),
+        Duration::from_secs(rebuild_window_secs),
+    );
 
     if idle_secs > 0 {
         let s = Arc::clone(&shared);
@@ -98,12 +112,14 @@ async fn event(
         .unwrap_or(false);
 
     let mut should_notify = None;
+    let mut state_changed = false;
     {
         let mut s = shared.write();
         s.touch();
         match event_name {
             "SessionStart" | "UserPromptSubmit" => {
                 s.upsert_working(session_id, cwd, tmux_loc);
+                state_changed = true;
             }
             "Notification" | "Stop" if pane_focused => {
                 info!(
@@ -111,14 +127,17 @@ async fn event(
                     "auto-cleared (user is focused on pane)"
                 );
                 s.upsert_working(session_id, cwd, tmux_loc);
+                state_changed = true;
             }
             "Notification" | "Stop" => {
                 let cwd_str = cwd.as_ref().map(|p| p.display().to_string());
                 should_notify = Some((session_id.clone(), cwd_str, message.clone()));
                 s.mark_waiting(session_id, cwd, tmux_loc, message);
+                state_changed = true;
             }
             "SessionEnd" => {
                 s.drop_session(&session_id);
+                state_changed = true;
             }
             other => {
                 info!(event = other, "ignoring unhandled hook event");
@@ -126,6 +145,9 @@ async fn event(
         }
         // suppress unused warning when event isn't an attention event
         let _ = is_attention_event;
+    }
+    if state_changed {
+        persist_now(&shared);
     }
     if let Some((sid, cwd, msg)) = should_notify {
         crate::notify::waiting(&sid, cwd.as_deref(), msg.as_deref());
@@ -153,11 +175,14 @@ struct VisitBody {
 }
 
 async fn visit(State(shared): State<Shared>, Json(b): Json<VisitBody>) -> StatusCode {
-    let mut s = shared.write();
-    s.touch();
-    let cleared = s.visit_pane(&b.pane);
+    let cleared = {
+        let mut s = shared.write();
+        s.touch();
+        s.visit_pane(&b.pane)
+    };
     if cleared {
         info!(pane = %b.pane, "cleared");
+        persist_now(&shared);
     }
     StatusCode::OK
 }
