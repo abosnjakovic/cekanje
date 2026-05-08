@@ -3,6 +3,7 @@ use crate::state::{Session, Status};
 use crate::tmux;
 use anyhow::{Context, Result, bail};
 use std::io::Write;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 pub async fn run(port: u16) -> Result<()> {
@@ -11,30 +12,40 @@ pub async fn run(port: u16) -> Result<()> {
         .context("fetch /list from cekanje daemon")?;
     let sessions: Vec<Session> = serde_json::from_str(&body).unwrap_or_default();
 
-    if sessions.is_empty() {
+    let renderable: Vec<&Session> = sessions.iter().filter(|s| s.tmux.is_some()).collect();
+
+    if renderable.is_empty() {
         eprintln!("(no claude sessions)");
         return Ok(());
     }
 
     let mut lines = String::new();
-    for s in &sessions {
+    for s in &renderable {
         let icon = match s.status {
             Status::Waiting => "⏳",
             Status::Working => "  ",
         };
-        let pane = s.tmux.as_ref().map(|t| t.pane.as_str()).unwrap_or("?");
-        let cwd = s
+        let label = s
             .cwd
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
-        let msg = s.last_message.as_deref().unwrap_or("");
+            .as_deref()
+            .and_then(Path::file_name)
+            .and_then(|n| n.to_str())
+            .map(String::from)
+            .or_else(|| s.tmux.as_ref().map(|t| t.pane.clone()))
+            .unwrap_or_else(|| "?".to_string());
+        let raw = s.last_message.as_deref().unwrap_or("");
+        let first = raw.lines().next().unwrap_or("");
+        let msg = if first.chars().count() > 80 {
+            format!("{}…", first.chars().take(79).collect::<String>())
+        } else {
+            first.to_string()
+        };
         let age = s
             .waiting_since_secs
-            .map(|n| format!(" {n}s"))
+            .map(|n| format!("{n}s"))
             .unwrap_or_default();
         lines.push_str(&format!(
-            "{icon} {pane:<6} {cwd}{age}  {msg}\t{sid}\n",
+            "{icon} {label:<10} {age:<5} {msg}\t{sid}\n",
             sid = s.session_id
         ));
     }

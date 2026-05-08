@@ -36,6 +36,10 @@ help:
 	@echo "  make build-all        - Release build for all release targets"
 	@echo "  make create-archives  - tar host release binary into target/release-archives/"
 	@echo ""
+	@echo "$(GREEN)Local install:$(NC)"
+	@echo "  make install-local    - cargo install --path . --force, then symlink cek → cekanje"
+	@echo "  make uninstall-local  - Remove cek symlink and cargo-uninstall the crate"
+	@echo ""
 	@echo "$(GREEN)Dry-runs:$(NC)"
 	@echo "  make test-crates      - cargo publish --dry-run"
 	@echo "  make test-homebrew    - Generate target/homebrew/$(CRATE).rb"
@@ -129,6 +133,26 @@ create-archives: build-release
 	@mkdir -p target/release-archives
 	@tar -C target/release -czf "target/release-archives/$(CRATE)-$(VERSION)-host.tar.gz" $(CRATE)
 	@echo "$(GREEN)✓ target/release-archives/$(CRATE)-$(VERSION)-host.tar.gz$(NC)"
+
+# ── Local install ────────────────────────────────────────────────────────
+
+.PHONY: install-local
+install-local:
+	cargo install --path . --force
+	@bin_dir="$${CARGO_HOME:-$$HOME/.cargo}/bin"; \
+		ln -sf $(CRATE) "$$bin_dir/cek"; \
+		echo "$(GREEN)✓ Installed $(CRATE) $(VERSION) to $$bin_dir (cek → $(CRATE))$(NC)"; \
+		case ":$$PATH:" in \
+			*":$$bin_dir:"*) ;; \
+			*) echo "$(YELLOW)⚠  $$bin_dir is not on \$$PATH — add it to use cek/cekanje$(NC)" ;; \
+		esac
+
+.PHONY: uninstall-local
+uninstall-local:
+	@bin_dir="$${CARGO_HOME:-$$HOME/.cargo}/bin"; \
+		rm -f "$$bin_dir/cek"
+	cargo uninstall $(CRATE) || true
+	@echo "$(GREEN)✓ Uninstalled $(CRATE)$(NC)"
 
 # ── Dry-runs ─────────────────────────────────────────────────────────────
 
