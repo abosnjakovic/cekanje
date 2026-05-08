@@ -172,6 +172,24 @@ impl State {
         }
     }
 
+    /// Insert a session loaded from persisted JSON. Replaces any existing entry
+    /// with the same id. Caller is responsible for calling `rebuild_pane_index()`
+    /// afterwards (or once after a batch of insertions).
+    pub fn insert_persisted(&mut self, session: Session) {
+        self.sessions.insert(session.session_id.clone(), session);
+    }
+
+    /// Recompute `by_pane` from current `sessions`. Use after bulk mutations to
+    /// the `tmux` field on stored sessions (loading, validating, heuristic binding).
+    pub fn rebuild_pane_index(&mut self) {
+        self.by_pane.clear();
+        for s in self.sessions.values() {
+            if let Some(loc) = &s.tmux {
+                self.by_pane.insert(loc.pane.clone(), s.session_id.clone());
+            }
+        }
+    }
+
     pub fn snapshot(&self) -> Vec<Session> {
         let mut out: Vec<Session> = self.sessions.values().cloned().collect();
         for s in &mut out {
