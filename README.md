@@ -102,8 +102,10 @@ Append to `~/.config/tmux/tmux.conf`:
 ```tmux
 set-hook -g session-created 'run-shell -b "cek serve --ensure"'
 set-hook -g pane-focus-in   'run-shell -b "cek visit #{pane_id}"'
-bind-key -n M-i run-shell 'tmux display-popup -E -w 80% -h 60% "cek menu"'
+bind-key -n M-i run-shell 'cek menu'
 ```
+
+`cek menu` self-launches a borderless fullscreen `tmux display-popup` and re-execs itself inside it (signalled via `CEK_FULLSCREEN_HOST=1`), so the binding stays trivial. Requires tmux 3.3+ for the `-B` flag.
 
 Reload: `tmux source-file ~/.config/tmux/tmux.conf`. Then bootstrap once with `cek serve --ensure` (the `session-created` hook only fires for newly-opened tmux sessions).
 
