@@ -49,9 +49,8 @@ help:
 	@echo "  make publish-crates   - Publish to crates.io"
 	@echo "  make publish-homebrew - Update Formula/$(CRATE).rb and push to main"
 	@echo ""
-	@echo "$(GREEN)release-plz (manual):$(NC)"
-	@echo "  make release-plz-update - Preview version bump + changelog (no PR)"
-	@echo "  make release-plz-pr     - Open release PR on GitHub"
+	@echo "$(GREEN)Release:$(NC)"
+	@echo "  make release          - Bump version, tag, push (triggers GH release workflow)"
 	@echo ""
 	@echo "$(GREEN)Utilities:$(NC)"
 	@echo "  make run              - cargo run"
@@ -178,21 +177,35 @@ publish-crates: check-env
 publish-homebrew: check-env
 	./scripts/publish_homebrew.sh
 
-# ── release-plz (manual) ─────────────────────────────────────────────────
+# ── Release ──────────────────────────────────────────────────────────────
 
-.PHONY: release-plz-update
-release-plz-update:
-	@command -v release-plz >/dev/null 2>&1 || { \
-		echo "$(RED)release-plz not installed. Run: cargo install release-plz$(NC)"; exit 1; }
-	release-plz update
-
-.PHONY: release-plz-pr
-release-plz-pr:
+.PHONY: release
+release:
 	@command -v release-plz >/dev/null 2>&1 || { \
 		echo "$(RED)release-plz not installed. Run: cargo install release-plz$(NC)"; exit 1; }
 	@command -v gh >/dev/null 2>&1 || { \
-		echo "$(RED)gh CLI required for token.$(NC)"; exit 1; }
-	release-plz release-pr --git-token "$$(gh auth token)"
+		echo "$(RED)gh CLI required.$(NC)"; exit 1; }
+	@[ -z "$$(git status --porcelain)" ] || { \
+		echo "$(RED)Working tree not clean. Commit or stash first.$(NC)"; exit 1; }
+	@branch=$$(git rev-parse --abbrev-ref HEAD); \
+		[ "$$branch" = "main" ] || { echo "$(RED)Must be on main (on $$branch).$(NC)"; exit 1; }
+	@git fetch origin main --quiet
+	@[ "$$(git rev-parse HEAD)" = "$$(git rev-parse origin/main)" ] || { \
+		echo "$(RED)Local main not in sync with origin/main.$(NC)"; exit 1; }
+	@old=$(VERSION); \
+		release-plz update; \
+		new=$$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2); \
+		if [ "$$old" = "$$new" ]; then \
+			echo "$(YELLOW)No version bump (release-plz found no releasable commits).$(NC)"; \
+			exit 1; \
+		fi; \
+		echo "$(GREEN)Bumped $$old → $$new$(NC)"; \
+		git add Cargo.toml Cargo.lock CHANGELOG.md; \
+		git commit -m "chore: release v$$new"; \
+		git tag "v$$new"; \
+		git push origin main; \
+		git push origin "v$$new"; \
+		echo "$(GREEN)✓ Pushed v$$new. Release workflow: https://github.com/$$(gh repo view --json nameWithOwner -q .nameWithOwner)/actions$(NC)"
 
 # ── Utilities ────────────────────────────────────────────────────────────
 
