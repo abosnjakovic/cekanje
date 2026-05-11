@@ -203,3 +203,125 @@ fn truncate_pad(s: &str, width: usize) -> String {
         out
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{Session, Status};
+
+    fn session(status: Status) -> Session {
+        let json = serde_json::json!({
+            "session_id": "S1",
+            "cwd": "/tmp/proj",
+            "tmux": { "pane": "%1", "socket": null },
+            "status": match status {
+                Status::Working => "working",
+                Status::Waiting => "waiting",
+            },
+            "last_message": "hello world",
+            "waiting_since_secs": 42u64,
+            "age_secs": 100u64,
+        });
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn truncate_pad_pads_short_ascii() {
+        assert_eq!(truncate_pad("hi", 5), "hi   ");
+    }
+
+    #[test]
+    fn truncate_pad_truncates_long_ascii() {
+        assert_eq!(truncate_pad("abcdef", 3), "abc");
+    }
+
+    #[test]
+    fn truncate_pad_handles_exact_width() {
+        assert_eq!(truncate_pad("abc", 3), "abc");
+    }
+
+    #[test]
+    fn truncate_pad_counts_unicode_codepoints_not_bytes() {
+        // ⏳ is 1 codepoint, multiple bytes.
+        let out = truncate_pad("⏳hi", 4);
+        assert_eq!(out.chars().count(), 4);
+        assert_eq!(out, "⏳hi ");
+    }
+
+    #[test]
+    fn shell_quote_wraps_plain_string() {
+        assert_eq!(shell_quote("/tmp/cek"), "'/tmp/cek'");
+    }
+
+    #[test]
+    fn shell_quote_escapes_single_quote() {
+        assert_eq!(shell_quote("O'Brien"), r"'O'\''Brien'");
+    }
+
+    #[test]
+    fn header_row_contains_column_titles() {
+        let h = header_row();
+        assert!(h.contains("PROJECT"));
+        assert!(h.contains("WAITING"));
+        assert!(h.contains("LAST MESSAGE"));
+    }
+
+    #[test]
+    fn format_row_waiting_uses_yellow_and_hourglass() {
+        let s = session(Status::Waiting);
+        let row = format_row(&s);
+        assert!(row.contains(YELLOW));
+        assert!(row.contains("⏳"));
+        assert!(row.contains("42s"));
+    }
+
+    #[test]
+    fn format_row_working_uses_dim_and_dash() {
+        let mut s = session(Status::Working);
+        s.waiting_since_secs = None;
+        let row = format_row(&s);
+        assert!(row.contains(DIM));
+        assert!(row.contains("—"));
+    }
+
+    #[test]
+    fn format_row_uses_project_name_from_cwd() {
+        let s = session(Status::Working);
+        let row = format_row(&s);
+        // PROJECT_W=16, "proj" padded.
+        assert!(row.contains("proj"));
+    }
+
+    #[test]
+    fn format_row_falls_back_to_pane_when_cwd_missing() {
+        let mut s = session(Status::Working);
+        s.cwd = None;
+        let row = format_row(&s);
+        assert!(row.contains("%1"));
+    }
+
+    #[test]
+    fn format_row_truncates_long_message_with_ellipsis() {
+        let mut s = session(Status::Working);
+        s.last_message = Some("x".repeat(200));
+        let row = format_row(&s);
+        assert!(row.contains('…'));
+    }
+
+    #[test]
+    fn format_row_takes_only_first_line_of_message() {
+        let mut s = session(Status::Working);
+        s.last_message = Some("first line\nsecond line".into());
+        let row = format_row(&s);
+        assert!(row.contains("first line"));
+        assert!(!row.contains("second line"));
+    }
+
+    #[test]
+    fn format_row_ends_with_session_id_as_last_field() {
+        let s = session(Status::Working);
+        let row = format_row(&s);
+        let last = row.split('\t').next_back().unwrap();
+        assert_eq!(last, "S1");
+    }
+}

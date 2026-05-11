@@ -1,10 +1,10 @@
 use crate::persist;
 use crate::restore;
-use crate::state::{self, Shared, TmuxLocation};
+use crate::state::{self, Shared, State, TmuxLocation};
 use crate::tmux;
 use axum::{
     Json, Router,
-    extract::State,
+    extract::State as AxumState,
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
@@ -56,22 +56,89 @@ pub async fn run(port: u16, idle_secs: u64, rebuild_window_secs: u64) -> anyhow:
         });
     }
 
-    let app = Router::new()
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await?;
+    info!(addr = %listener.local_addr()?, idle_secs, "cekanje listening");
+    axum::serve(listener, router(shared)).await?;
+    Ok(())
+}
+
+pub(crate) fn router(shared: Shared) -> Router {
+    Router::new()
         .route("/hooks/event", post(event))
         .route("/status", get(status))
         .route("/list", get(list))
         .route("/visit", post(visit))
-        .with_state(shared);
+        .with_state(shared)
+}
 
-    let addr = format!("127.0.0.1:{port}");
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    info!(addr = %addr, idle_secs, "cekanje listening");
-    axum::serve(listener, app).await?;
-    Ok(())
+/// Outcome of applying a hook event to in-memory state. The handler uses
+/// `state_changed` to decide whether to persist, and `notify` to decide
+/// whether to send a desktop notification.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct EventOutcome {
+    pub state_changed: bool,
+    pub notify: Option<NotifyPayload>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct NotifyPayload {
+    pub session_id: String,
+    pub cwd: Option<String>,
+    pub message: Option<String>,
+}
+
+/// Apply a single hook event to state. Pure — no I/O, no logging side effects.
+pub(crate) fn apply_event(
+    s: &mut State,
+    event_name: &str,
+    session_id: String,
+    cwd: Option<PathBuf>,
+    tmux_loc: Option<TmuxLocation>,
+    message: Option<String>,
+    pane_focused: bool,
+) -> EventOutcome {
+    s.touch();
+    match event_name {
+        "SessionStart" | "UserPromptSubmit" => {
+            s.upsert_working(session_id, cwd, tmux_loc);
+            EventOutcome {
+                state_changed: true,
+                notify: None,
+            }
+        }
+        "Notification" | "Stop" if pane_focused => {
+            s.upsert_working(session_id, cwd, tmux_loc);
+            EventOutcome {
+                state_changed: true,
+                notify: None,
+            }
+        }
+        "Notification" | "Stop" => {
+            let cwd_str = cwd.as_ref().map(|p| p.display().to_string());
+            let payload = NotifyPayload {
+                session_id: session_id.clone(),
+                cwd: cwd_str,
+                message: message.clone(),
+            };
+            s.mark_waiting(session_id, cwd, tmux_loc, message);
+            EventOutcome {
+                state_changed: true,
+                notify: Some(payload),
+            }
+        }
+        "SessionEnd" => {
+            s.drop_session(&session_id);
+            EventOutcome {
+                state_changed: true,
+                notify: None,
+            }
+        }
+        _ => EventOutcome::default(),
+    }
 }
 
 async fn event(
-    State(shared): State<Shared>,
+    AxumState(shared): AxumState<Shared>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> StatusCode {
@@ -101,61 +168,35 @@ async fn event(
         socket: socket.clone(),
     });
 
-    info!(event_name, %session_id, ?tmux_loc, "event");
-
-    // Auto-clear: if a Notification or Stop fires for a pane the user is currently
-    // looking at, treat as Working — no badge bump, no popup.
-    let is_attention_event = matches!(event_name, "Notification" | "Stop");
     let pane_focused = tmux_loc
         .as_ref()
         .map(|t| tmux::is_pane_focused(t.socket.as_deref(), &t.pane))
         .unwrap_or(false);
 
-    let mut should_notify = None;
-    let mut state_changed = false;
-    {
+    info!(event_name, %session_id, ?tmux_loc, pane_focused, "event");
+
+    let outcome = {
         let mut s = shared.write();
-        s.touch();
-        match event_name {
-            "SessionStart" | "UserPromptSubmit" => {
-                s.upsert_working(session_id, cwd, tmux_loc);
-                state_changed = true;
-            }
-            "Notification" | "Stop" if pane_focused => {
-                info!(
-                    pane = ?tmux_loc.as_ref().map(|t| &t.pane),
-                    "auto-cleared (user is focused on pane)"
-                );
-                s.upsert_working(session_id, cwd, tmux_loc);
-                state_changed = true;
-            }
-            "Notification" | "Stop" => {
-                let cwd_str = cwd.as_ref().map(|p| p.display().to_string());
-                should_notify = Some((session_id.clone(), cwd_str, message.clone()));
-                s.mark_waiting(session_id, cwd, tmux_loc, message);
-                state_changed = true;
-            }
-            "SessionEnd" => {
-                s.drop_session(&session_id);
-                state_changed = true;
-            }
-            other => {
-                info!(event = other, "ignoring unhandled hook event");
-            }
-        }
-        // suppress unused warning when event isn't an attention event
-        let _ = is_attention_event;
-    }
-    if state_changed {
+        apply_event(
+            &mut s,
+            event_name,
+            session_id,
+            cwd,
+            tmux_loc,
+            message,
+            pane_focused,
+        )
+    };
+    if outcome.state_changed {
         persist_now(&shared);
     }
-    if let Some((sid, cwd, msg)) = should_notify {
-        crate::notify::waiting(&sid, cwd.as_deref(), msg.as_deref());
+    if let Some(n) = outcome.notify {
+        crate::notify::waiting(&n.session_id, n.cwd.as_deref(), n.message.as_deref());
     }
     StatusCode::OK
 }
 
-async fn status(State(shared): State<Shared>) -> String {
+async fn status(AxumState(shared): AxumState<Shared>) -> String {
     let n = shared.read().waiting_count();
     if n == 0 {
         String::new()
@@ -164,7 +205,7 @@ async fn status(State(shared): State<Shared>) -> String {
     }
 }
 
-async fn list(State(shared): State<Shared>) -> impl IntoResponse {
+async fn list(AxumState(shared): AxumState<Shared>) -> impl IntoResponse {
     let snapshot = shared.read().snapshot();
     Json(snapshot)
 }
@@ -174,7 +215,7 @@ struct VisitBody {
     pane: String,
 }
 
-async fn visit(State(shared): State<Shared>, Json(b): Json<VisitBody>) -> StatusCode {
+async fn visit(AxumState(shared): AxumState<Shared>, Json(b): Json<VisitBody>) -> StatusCode {
     let cleared = {
         let mut s = shared.write();
         s.touch();
@@ -192,4 +233,262 @@ fn header_value(h: &HeaderMap, name: &str) -> Option<String> {
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty())
         .map(String::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client;
+
+    fn pane(p: &str) -> Option<TmuxLocation> {
+        Some(TmuxLocation {
+            pane: p.into(),
+            socket: None,
+        })
+    }
+
+    // ── apply_event (pure) ──────────────────────────────────────────────
+
+    #[test]
+    fn apply_event_session_start_upserts_working() {
+        let mut s = State::default();
+        let out = apply_event(
+            &mut s,
+            "SessionStart",
+            "S1".into(),
+            Some("/tmp/a".into()),
+            pane("%1"),
+            None,
+            false,
+        );
+        assert!(out.state_changed);
+        assert!(out.notify.is_none());
+        assert_eq!(s.sessions["S1"].status, crate::state::Status::Working);
+        assert_eq!(s.by_pane["%1"], "S1");
+    }
+
+    #[test]
+    fn apply_event_user_prompt_submit_upserts_working() {
+        let mut s = State::default();
+        let out = apply_event(
+            &mut s,
+            "UserPromptSubmit",
+            "S1".into(),
+            None,
+            pane("%1"),
+            None,
+            false,
+        );
+        assert!(out.state_changed);
+        assert!(out.notify.is_none());
+        assert_eq!(s.sessions["S1"].status, crate::state::Status::Working);
+    }
+
+    #[test]
+    fn apply_event_notification_when_focused_does_not_notify() {
+        let mut s = State::default();
+        let out = apply_event(
+            &mut s,
+            "Notification",
+            "S1".into(),
+            Some("/tmp/a".into()),
+            pane("%1"),
+            Some("hi".into()),
+            true,
+        );
+        assert!(out.state_changed);
+        assert!(out.notify.is_none());
+        assert_eq!(s.sessions["S1"].status, crate::state::Status::Working);
+    }
+
+    #[test]
+    fn apply_event_notification_unfocused_marks_waiting_and_notifies() {
+        let mut s = State::default();
+        let out = apply_event(
+            &mut s,
+            "Notification",
+            "S1".into(),
+            Some("/tmp/a".into()),
+            pane("%1"),
+            Some("permission?".into()),
+            false,
+        );
+        assert!(out.state_changed);
+        let n = out.notify.expect("notify payload");
+        assert_eq!(n.session_id, "S1");
+        assert_eq!(n.cwd.as_deref(), Some("/tmp/a"));
+        assert_eq!(n.message.as_deref(), Some("permission?"));
+        assert_eq!(s.sessions["S1"].status, crate::state::Status::Waiting);
+    }
+
+    #[test]
+    fn apply_event_stop_unfocused_mirrors_notification() {
+        let mut s = State::default();
+        let out = apply_event(&mut s, "Stop", "S1".into(), None, pane("%1"), None, false);
+        assert!(out.notify.is_some());
+        assert_eq!(s.sessions["S1"].status, crate::state::Status::Waiting);
+    }
+
+    #[test]
+    fn apply_event_session_end_drops_session() {
+        let mut s = State::default();
+        s.upsert_working("S1".into(), None, pane("%1"));
+        let out = apply_event(&mut s, "SessionEnd", "S1".into(), None, None, None, false);
+        assert!(out.state_changed);
+        assert!(out.notify.is_none());
+        assert!(s.sessions.is_empty());
+        assert!(s.by_pane.is_empty());
+    }
+
+    #[test]
+    fn apply_event_unknown_event_is_noop() {
+        let mut s = State::default();
+        let out = apply_event(
+            &mut s,
+            "PreToolUse",
+            "S1".into(),
+            None,
+            pane("%1"),
+            None,
+            false,
+        );
+        assert!(!out.state_changed);
+        assert!(out.notify.is_none());
+        assert!(s.sessions.is_empty());
+    }
+
+    // ── HTTP integration via real TCP listener ──────────────────────────
+
+    async fn spawn() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let shared = state::new_shared();
+        let app = router(shared);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn status_endpoint_empty_when_no_waiting() {
+        let port = spawn().await;
+        let body = client::http_get(port, "/status").await.unwrap();
+        assert_eq!(body, "");
+    }
+
+    #[tokio::test]
+    async fn status_endpoint_returns_badge_when_waiting() {
+        let port = spawn().await;
+        let evt = serde_json::json!({
+            "hook_event_name": "Notification",
+            "session_id": "S1",
+            "cwd": "/tmp/a",
+            "message": "permission?",
+        })
+        .to_string();
+        client::http_post_json(port, "/hooks/event", &evt)
+            .await
+            .unwrap();
+        let body = client::http_get(port, "/status").await.unwrap();
+        assert_eq!(body, "⏳1");
+    }
+
+    #[tokio::test]
+    async fn list_endpoint_returns_json_snapshot() {
+        let port = spawn().await;
+        let evt = serde_json::json!({
+            "hook_event_name": "SessionStart",
+            "session_id": "S1",
+            "cwd": "/tmp/a",
+        })
+        .to_string();
+        client::http_post_json(port, "/hooks/event", &evt)
+            .await
+            .unwrap();
+        let body = client::http_get(port, "/list").await.unwrap();
+        let arr: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["session_id"], "S1");
+        assert_eq!(arr[0]["status"], "working");
+    }
+
+    #[tokio::test]
+    async fn visit_endpoint_clears_waiting_for_pane() {
+        let port = spawn().await;
+        // Seed a waiting session bound to pane %42.
+        // (We can't easily set headers via our minimalist client, so we use
+        // the SessionStart path to register pane via headers — instead we
+        // just register without a pane and visit with no pane; we want to
+        // test the round-trip, so send a Notification with a header.)
+        // Simpler: use a raw TCP request with the x-tmux-pane header.
+        let evt_body = serde_json::json!({
+            "hook_event_name": "Notification",
+            "session_id": "S1",
+            "cwd": "/tmp/a",
+        })
+        .to_string();
+        send_with_pane_header(port, "/hooks/event", &evt_body, "%42")
+            .await
+            .unwrap();
+        // Confirm waiting.
+        assert_eq!(client::http_get(port, "/status").await.unwrap(), "⏳1");
+
+        // Visit clears.
+        let visit = serde_json::json!({ "pane": "%42" }).to_string();
+        client::http_post_json(port, "/visit", &visit)
+            .await
+            .unwrap();
+        assert_eq!(client::http_get(port, "/status").await.unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn event_endpoint_400_when_session_id_missing() {
+        let port = spawn().await;
+        let evt = serde_json::json!({
+            "hook_event_name": "SessionStart",
+            "cwd": "/tmp/a",
+        })
+        .to_string();
+        let raw = raw_post(port, "/hooks/event", &evt, &[]).await.unwrap();
+        assert!(
+            raw.starts_with("HTTP/1.1 400"),
+            "expected 400, got: {}",
+            raw.lines().next().unwrap_or("")
+        );
+    }
+
+    /// Minimal raw POST helper that lets us attach extra headers (the
+    /// production `client::http_post_json` doesn't).
+    async fn raw_post(
+        port: u16,
+        path: &str,
+        body: &str,
+        extra_headers: &[(&str, &str)],
+    ) -> std::io::Result<String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+        let mut req = format!(
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
+            body.len()
+        );
+        for (k, v) in extra_headers {
+            req.push_str(&format!("{k}: {v}\r\n"));
+        }
+        req.push_str("\r\n");
+        req.push_str(body);
+        stream.write_all(req.as_bytes()).await?;
+        let mut buf = String::new();
+        stream.read_to_string(&mut buf).await?;
+        Ok(buf)
+    }
+
+    async fn send_with_pane_header(
+        port: u16,
+        path: &str,
+        body: &str,
+        pane: &str,
+    ) -> std::io::Result<String> {
+        raw_post(port, path, body, &[("x-tmux-pane", pane)]).await
+    }
 }

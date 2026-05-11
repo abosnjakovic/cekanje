@@ -15,10 +15,10 @@
 
 use crate::persist;
 use crate::rebuild;
-use crate::state::Shared;
+use crate::state::{Shared, State, TmuxLocation};
 use crate::tmux;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -91,12 +91,19 @@ fn bind_unbound_via_heuristic(shared: &Shared) -> usize {
     if panes_by_cwd.is_empty() {
         return 0;
     }
+    bind_unbound_with_panes(&mut shared.write(), &panes_by_cwd)
+}
 
-    let mut s = shared.write();
+/// Pure binding pass: given current state and a snapshot of tmux panes running
+/// `claude` grouped by cwd, attach exactly one unbound session per cwd when
+/// exactly one matching free pane exists. Returns the number of sessions bound.
+pub(crate) fn bind_unbound_with_panes(
+    s: &mut State,
+    panes_by_cwd: &HashMap<PathBuf, Vec<TmuxLocation>>,
+) -> usize {
     let mut bound_panes: std::collections::HashSet<String> = s.by_pane.keys().cloned().collect();
     let mut bound = 0;
 
-    // Group unbound sessions by cwd so we can spot ambiguity at the cwd level.
     let mut unbound_by_cwd: HashMap<&Path, Vec<&str>> = HashMap::new();
     for sess in s.sessions.values() {
         if sess.tmux.is_some() {
@@ -110,12 +117,12 @@ fn bind_unbound_via_heuristic(shared: &Shared) -> usize {
         }
     }
 
-    let mut bindings: Vec<(String, crate::state::TmuxLocation)> = Vec::new();
+    let mut bindings: Vec<(String, TmuxLocation)> = Vec::new();
     for (cwd, sids) in &unbound_by_cwd {
         let Some(panes) = panes_by_cwd.get(*cwd) else {
             continue;
         };
-        let unbound_panes: Vec<&crate::state::TmuxLocation> = panes
+        let unbound_panes: Vec<&TmuxLocation> = panes
             .iter()
             .filter(|p| !bound_panes.contains(&p.pane))
             .collect();
@@ -140,4 +147,146 @@ fn bind_unbound_via_heuristic(shared: &Shared) -> usize {
         s.rebuild_pane_index();
     }
     bound
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::persist;
+
+    fn tempfile(suffix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "cekanje-restore-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            suffix,
+        ))
+    }
+
+    fn pane(p: &str) -> TmuxLocation {
+        TmuxLocation {
+            pane: p.into(),
+            socket: None,
+        }
+    }
+
+    #[test]
+    fn load_persisted_returns_zero_when_path_is_none() {
+        let shared = crate::state::new_shared();
+        assert_eq!(load_persisted(&shared, None), 0);
+        assert!(shared.read().sessions.is_empty());
+    }
+
+    #[test]
+    fn load_persisted_returns_zero_when_file_missing() {
+        let shared = crate::state::new_shared();
+        let path = tempfile("missing.json");
+        assert!(!path.exists());
+        assert_eq!(load_persisted(&shared, Some(&path)), 0);
+    }
+
+    #[test]
+    fn load_persisted_populates_sessions_from_valid_file() {
+        let shared = crate::state::new_shared();
+        let path = tempfile("valid.json");
+        {
+            let mut seed = State::default();
+            seed.upsert_working("S1".into(), Some("/tmp/a".into()), Some(pane("%1")));
+            seed.upsert_working("S2".into(), Some("/tmp/b".into()), Some(pane("%2")));
+            persist::save(&path, &seed).unwrap();
+        }
+        let n = load_persisted(&shared, Some(&path));
+        assert_eq!(n, 2);
+        let s = shared.read();
+        assert_eq!(s.sessions.len(), 2);
+        // by_pane index rebuilt
+        assert_eq!(s.by_pane["%1"], "S1");
+        assert_eq!(s.by_pane["%2"], "S2");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_persisted_returns_zero_on_bad_schema() {
+        let shared = crate::state::new_shared();
+        let path = tempfile("badschema.json");
+        std::fs::write(&path, r#"{"version": 99, "sessions": []}"#).unwrap();
+        assert_eq!(load_persisted(&shared, Some(&path)), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn bind_unbound_attaches_unique_cwd_to_unique_pane() {
+        let mut s = State::default();
+        s.upsert_working("S1".into(), Some("/tmp/a".into()), None);
+        let mut panes = HashMap::new();
+        panes.insert(PathBuf::from("/tmp/a"), vec![pane("%9")]);
+
+        let n = bind_unbound_with_panes(&mut s, &panes);
+        assert_eq!(n, 1);
+        assert_eq!(s.sessions["S1"].tmux.as_ref().unwrap().pane, "%9");
+        assert_eq!(s.by_pane["%9"], "S1");
+    }
+
+    #[test]
+    fn bind_unbound_skips_ambiguous_cwd_with_multiple_sessions() {
+        let mut s = State::default();
+        s.upsert_working("S1".into(), Some("/tmp/a".into()), None);
+        s.upsert_working("S2".into(), Some("/tmp/a".into()), None);
+        let mut panes = HashMap::new();
+        panes.insert(PathBuf::from("/tmp/a"), vec![pane("%9")]);
+
+        let n = bind_unbound_with_panes(&mut s, &panes);
+        assert_eq!(n, 0);
+        assert!(s.sessions["S1"].tmux.is_none());
+        assert!(s.sessions["S2"].tmux.is_none());
+    }
+
+    #[test]
+    fn bind_unbound_skips_when_no_matching_cwd_in_panes_map() {
+        let mut s = State::default();
+        s.upsert_working("S1".into(), Some("/tmp/a".into()), None);
+        let mut panes = HashMap::new();
+        panes.insert(PathBuf::from("/tmp/other"), vec![pane("%9")]);
+
+        let n = bind_unbound_with_panes(&mut s, &panes);
+        assert_eq!(n, 0);
+        assert!(s.sessions["S1"].tmux.is_none());
+    }
+
+    #[test]
+    fn bind_unbound_does_not_steal_pane_already_bound_to_another_session() {
+        let mut s = State::default();
+        // S0 already owns %9.
+        s.upsert_working("S0".into(), Some("/tmp/a".into()), Some(pane("%9")));
+        // S1 is unbound in the same cwd.
+        s.upsert_working("S1".into(), Some("/tmp/a".into()), None);
+        let mut panes = HashMap::new();
+        panes.insert(PathBuf::from("/tmp/a"), vec![pane("%9")]);
+
+        let n = bind_unbound_with_panes(&mut s, &panes);
+        assert_eq!(n, 0);
+        assert!(s.sessions["S1"].tmux.is_none());
+    }
+
+    #[test]
+    fn bind_unbound_skips_session_without_cwd() {
+        let mut s = State::default();
+        s.upsert_working("S1".into(), None, None);
+        let mut panes = HashMap::new();
+        panes.insert(PathBuf::from("/tmp/a"), vec![pane("%9")]);
+
+        let n = bind_unbound_with_panes(&mut s, &panes);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn bind_unbound_returns_zero_when_panes_map_empty() {
+        let mut s = State::default();
+        s.upsert_working("S1".into(), Some("/tmp/a".into()), None);
+        let panes = HashMap::new();
+        assert_eq!(bind_unbound_with_panes(&mut s, &panes), 0);
+    }
 }
