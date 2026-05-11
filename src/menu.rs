@@ -15,7 +15,17 @@ const DIM: &str = "\x1b[2m";
 const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
 
+/// Set on the child process when we re-launch ourselves inside a tmux popup.
+/// Presence means "render the picker in-line"; absence means "wrap me in a
+/// fullscreen popup first". The single env var keeps the bind config small —
+/// users put `cek menu` on their key and the binary handles the popup.
+const FULLSCREEN_ENV: &str = "CEK_FULLSCREEN_HOST";
+
 pub async fn run(port: u16) -> Result<()> {
+    if std::env::var_os(FULLSCREEN_ENV).is_none() {
+        return relaunch_in_popup(port);
+    }
+
     let body = client::http_get(port, "/list")
         .await
         .context("fetch /list from cekanje daemon")?;
@@ -132,6 +142,50 @@ fn format_row(s: &Session) -> String {
         "{colour}{icon} {project}{RESET}\t{colour}{waiting}{RESET}\t{colour}{message}{RESET}\t \t{sid}",
         sid = s.session_id,
     )
+}
+
+/// Re-launch `cek menu` inside a borderless fullscreen tmux popup. `-E` makes
+/// the popup auto-close when the inner command exits; `-B` removes the popup
+/// border; `100%` width and height fill the terminal. The child sees
+/// `CEK_FULLSCREEN_HOST=1` and skips this branch.
+fn relaunch_in_popup(port: u16) -> Result<()> {
+    let exe = std::env::current_exe().context("locate current binary")?;
+    let exe_str = exe
+        .to_str()
+        .context("current binary path is not valid UTF-8")?;
+    let inner = format!("{} menu --port {}", shell_quote(exe_str), port);
+
+    let status = Command::new("tmux")
+        .args([
+            "display-popup",
+            "-E",
+            "-B",
+            "-w",
+            "100%",
+            "-h",
+            "100%",
+            "-e",
+            &format!("{FULLSCREEN_ENV}=1"),
+        ])
+        .arg(&inner)
+        .status()
+        .context(
+            "spawn tmux display-popup — is tmux installed and are you inside a tmux session?",
+        )?;
+    if !status.success() {
+        bail!("tmux display-popup exited with {status}");
+    }
+    Ok(())
+}
+
+/// Single-quote a shell argument. Adequate for filesystem paths — we replace
+/// any embedded single quote with the standard `'\''` close-reopen idiom.
+fn shell_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    out.push_str(&s.replace('\'', "'\\''"));
+    out.push('\'');
+    out
 }
 
 /// Truncate to `width` chars (Unicode-aware) and right-pad with spaces. Avoids
