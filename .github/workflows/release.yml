@@ -80,17 +80,18 @@ jobs:
     needs: bump-and-tag
     runs-on: ubuntu-latest
     steps:
-      - name: Create release
+      - name: Generate release notes
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           TAG: ${{ needs.bump-and-tag.outputs.tag }}
           VERSION: ${{ needs.bump-and-tag.outputs.version }}
         run: |
-          gh release create "${TAG}" \
-            --repo "${REPO}" \
-            --title "Release ${TAG}" \
-            --notes "Release ${VERSION}
+          gh api "repos/${REPO}/releases/generate-notes" \
+            -f tag_name="${TAG}" \
+            --jq .body > /tmp/notes.md
+
+          cat >> /tmp/notes.md <<EOF
 
           ## Installation
 
@@ -107,18 +108,30 @@ jobs:
 
           ### macOS (Apple Silicon)
           \`\`\`bash
-          curl -L \"https://github.com/${REPO}/releases/download/${TAG}/cekanje-${VERSION}-aarch64-apple-darwin.tar.gz\" | tar xz
+          curl -L "https://github.com/${REPO}/releases/download/${TAG}/cekanje-${VERSION}-aarch64-apple-darwin.tar.gz" | tar xz
           \`\`\`
 
           ### macOS (Intel)
           \`\`\`bash
-          curl -L \"https://github.com/${REPO}/releases/download/${TAG}/cekanje-${VERSION}-x86_64-apple-darwin.tar.gz\" | tar xz
+          curl -L "https://github.com/${REPO}/releases/download/${TAG}/cekanje-${VERSION}-x86_64-apple-darwin.tar.gz" | tar xz
           \`\`\`
 
           ### Linux (x86_64)
           \`\`\`bash
-          curl -L \"https://github.com/${REPO}/releases/download/${TAG}/cekanje-${VERSION}-x86_64-unknown-linux-gnu.tar.gz\" | tar xz
-          \`\`\`"
+          curl -L "https://github.com/${REPO}/releases/download/${TAG}/cekanje-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" | tar xz
+          \`\`\`
+          EOF
+
+      - name: Create release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.bump-and-tag.outputs.tag }}
+        run: |
+          gh release create "${TAG}" \
+            --repo "${REPO}" \
+            --title "Release ${TAG}" \
+            --notes-file /tmp/notes.md
 
   build-release:
     name: Build ${{ matrix.target }}
