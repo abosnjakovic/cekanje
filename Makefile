@@ -49,8 +49,7 @@ help:
 	@echo "  make publish-crates   - Publish to crates.io"
 	@echo "  make publish-homebrew - Update Formula/$(CRATE).rb and push to main"
 	@echo ""
-	@echo "$(GREEN)Release:$(NC)"
-	@echo "  make release [BUMP=patch|minor|major]  - Bump, commit, tag, push (default: patch)"
+	@echo "$(GREEN)Release:$(NC)  Trigger via GitHub Actions → Release → Run workflow"
 	@echo ""
 	@echo "$(GREEN)Utilities:$(NC)"
 	@echo "  make run              - cargo run"
@@ -177,39 +176,6 @@ publish-crates: check-env
 publish-homebrew: check-env
 	./scripts/publish_homebrew.sh
 
-# ── Release ──────────────────────────────────────────────────────────────
-
-BUMP ?= patch
-
-.PHONY: release
-release:
-	@[ -z "$$(git status --porcelain)" ] || { \
-		echo "$(RED)Working tree not clean. Commit or stash first.$(NC)"; exit 1; }
-	@branch=$$(git rev-parse --abbrev-ref HEAD); \
-		[ "$$branch" = "main" ] || { echo "$(RED)Must be on main (on $$branch).$(NC)"; exit 1; }
-	@git fetch origin main --quiet
-	@[ "$$(git rev-parse HEAD)" = "$$(git rev-parse origin/main)" ] || { \
-		echo "$(RED)Local main not in sync with origin/main.$(NC)"; exit 1; }
-	@old=$(VERSION); \
-		ma=$$(echo "$$old" | cut -d. -f1); \
-		mi=$$(echo "$$old" | cut -d. -f2); \
-		pa=$$(echo "$$old" | cut -d. -f3); \
-		case "$(BUMP)" in \
-			major) ma=$$((ma+1)); mi=0; pa=0;; \
-			minor) mi=$$((mi+1)); pa=0;; \
-			patch) pa=$$((pa+1));; \
-			*) echo "$(RED)BUMP must be patch|minor|major (got $(BUMP)).$(NC)"; exit 1;; \
-		esac; \
-		new="$$ma.$$mi.$$pa"; \
-		echo "$(BLUE)Bumping $$old → $$new ($(BUMP))$(NC)"; \
-		sed -i.bak -E "s/^version = \"[^\"]+\"/version = \"$$new\"/" Cargo.toml && rm Cargo.toml.bak; \
-		cargo update -p cekanje --precise "$$new" --offline >/dev/null 2>&1 || cargo check --quiet; \
-		git add Cargo.toml Cargo.lock; \
-		git commit -m "chore: release v$$new"; \
-		git tag "v$$new"; \
-		git push origin main; \
-		git push origin "v$$new"; \
-		echo "$(GREEN)✓ Pushed v$$new — release workflow triggered$(NC)"
 
 # ── Utilities ────────────────────────────────────────────────────────────
 
