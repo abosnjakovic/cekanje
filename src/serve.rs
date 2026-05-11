@@ -1,19 +1,22 @@
 use crate::persist;
+use crate::reload;
 use crate::restore;
 use crate::state::{self, Shared, State, TmuxLocation};
 use crate::tmux;
 use axum::{
     Json, Router,
-    extract::State as AxumState,
+    extract::{Request, State as AxumState},
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use tokio::sync::Notify;
 use tracing::{info, warn};
 
 static PERSIST_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
@@ -42,6 +45,11 @@ pub async fn run(port: u16, idle_secs: u64, rebuild_window_secs: u64) -> anyhow:
         Duration::from_secs(rebuild_window_secs),
     );
 
+    let shutdown = Arc::new(Notify::new());
+    if let Err(e) = init_reload(shutdown.clone()) {
+        warn!(error = %e, "reload init failed; hot-reload disabled this session");
+    }
+
     if idle_secs > 0 {
         let s = Arc::clone(&shared);
         let threshold = Duration::from_secs(idle_secs);
@@ -56,19 +64,101 @@ pub async fn run(port: u16, idle_secs: u64, rebuild_window_secs: u64) -> anyhow:
         });
     }
 
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await?;
+    let listener = bind_with_retry(port).await?;
     info!(addr = %listener.local_addr()?, idle_secs, "cekanje listening");
-    axum::serve(listener, router(shared)).await?;
+
+    let shutdown_signal = {
+        let n = shutdown.clone();
+        async move {
+            n.notified().await;
+        }
+    };
+    let serve_fut = axum::serve(listener, router(shared)).with_graceful_shutdown(shutdown_signal);
+
+    // Drain ceiling: once shutdown is signalled, give in-flight handlers up
+    // to 3 seconds to finish. If they don't, drop the serve future to force
+    // termination so the swap (or normal exit) can proceed.
+    let drain_deadline = {
+        let n = shutdown.clone();
+        async move {
+            n.notified().await;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    };
+
+    tokio::select! {
+        res = serve_fut => { res?; }
+        _ = drain_deadline => {
+            warn!("graceful drain exceeded 3s; forcing shutdown");
+        }
+    }
+
+    if reload::was_swap_requested() {
+        // Returns Infallible on success — control transfers into the new image.
+        // If we reach here with an Err, fall through and exit with that error.
+        reload::replace_process_image()?;
+    }
     Ok(())
+}
+
+fn init_reload(shutdown: Arc<Notify>) -> anyhow::Result<()> {
+    let exe = std::env::current_exe()?;
+    let argv_tail: Vec<String> = std::env::args().skip(1).collect();
+    reload::init(exe, argv_tail, shutdown)
+}
+
+/// Bind 127.0.0.1:port with a brief retry loop. Covers the race between an
+/// outgoing process image releasing the port and a fresh image rebinding it
+/// after `execve(2)`.
+async fn bind_with_retry(port: u16) -> anyhow::Result<tokio::net::TcpListener> {
+    let addr = format!("127.0.0.1:{port}");
+    let mut last_err: Option<std::io::Error> = None;
+    for attempt in 0..10 {
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(l) => {
+                if attempt > 0 {
+                    info!(attempt, "bound after retry");
+                }
+                return Ok(l);
+            }
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+    Err(last_err
+        .map(anyhow::Error::from)
+        .unwrap_or_else(|| anyhow::anyhow!("bind failed")))
 }
 
 pub(crate) fn router(shared: Shared) -> Router {
     Router::new()
         .route("/hooks/event", post(event))
+        .route_layer(middleware::from_fn(reload_check))
         .route("/status", get(status))
         .route("/list", get(list))
         .route("/visit", post(visit))
+        .route("/admin/version", get(version))
         .with_state(shared)
+}
+
+/// Post-handler middleware on `/hooks/event`. Cheap fingerprint check; if
+/// the binary has changed since startup, signals the server to drain and
+/// re-image. Runs after the handler returns so the response path stays fast.
+async fn reload_check(req: Request, next: Next) -> Response {
+    let resp = next.run(req).await;
+    reload::request_swap_if_stale();
+    resp
+}
+
+async fn version() -> Json<Value> {
+    Json(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "startup_fp": reload::ctx().map(|c| c.startup_fp),
+        "current_fp": reload::current_fp(),
+        "swap_in_flight": reload::was_swap_requested(),
+    }))
 }
 
 /// Outcome of applying a hook event to in-memory state. The handler uses

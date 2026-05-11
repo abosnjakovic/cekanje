@@ -6,6 +6,7 @@ mod notify;
 mod persist;
 mod preview;
 mod rebuild;
+mod reload;
 mod restore;
 mod serve;
 mod state;
