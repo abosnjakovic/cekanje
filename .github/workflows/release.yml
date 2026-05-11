@@ -1,10 +1,17 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
+    inputs:
+      bump:
+        description: "Semver bump"
+        required: false
+        default: "patch"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,51 +20,73 @@ permissions:
   contents: write
 
 jobs:
-  create-release:
-    name: Create GitHub Release
+  bump-and-tag:
+    name: Bump version + tag
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.meta.outputs.version }}
-      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.bump.outputs.version }}
+      tag: ${{ steps.bump.outputs.tag }}
     steps:
-      - name: Checkout repository
+      - name: Checkout main
         uses: actions/checkout@v6
         with:
+          ref: main
           fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Resolve version + tag
-        id: meta
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Bump Cargo.toml + Cargo.lock
+        id: bump
         env:
-          REF_NAME: ${{ github.ref_name }}
-          REF_TYPE: ${{ github.ref_type }}
+          BUMP: ${{ inputs.bump }}
         run: |
-          if [ "${REF_TYPE}" = "tag" ]; then
-            tag="${REF_NAME}"
-          else
-            tag=$(git tag --list 'v*' --sort=-v:refname | head -n1)
-            [ -n "${tag}" ] || { echo "No v* tag in repo. Push a release tag first." >&2; exit 1; }
-            echo "Dispatched from '${REF_NAME}' — using latest tag '${tag}'."
-          fi
-          case "${tag}" in
-            v*) ;;
-            *) echo "Refusing to release from non-tag ref '${tag}'. Dispatch from a v* tag." >&2; exit 1;;
+          old=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
+          ma=$(echo "$old" | cut -d. -f1)
+          mi=$(echo "$old" | cut -d. -f2)
+          pa=$(echo "$old" | cut -d. -f3)
+          case "$BUMP" in
+            major) ma=$((ma+1)); mi=0; pa=0;;
+            minor) mi=$((mi+1)); pa=0;;
+            patch) pa=$((pa+1));;
+            *) echo "Unknown bump '$BUMP'." >&2; exit 1;;
           esac
-          version="${tag#v}"
-          echo "tag=${tag}"         >> "$GITHUB_OUTPUT"
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          new="$ma.$mi.$pa"
+          echo "Bumping $old -> $new ($BUMP)"
+          sed -i.bak -E "s/^version = \"[^\"]+\"/version = \"$new\"/" Cargo.toml
+          rm Cargo.toml.bak
+          cargo update -p cekanje --precise "$new" --offline >/dev/null 2>&1 || cargo check --quiet
+          echo "version=$new" >> "$GITHUB_OUTPUT"
+          echo "tag=v$new"    >> "$GITHUB_OUTPUT"
 
+      - name: Commit, tag, push
+        env:
+          NEW_VERSION: ${{ steps.bump.outputs.version }}
+          NEW_TAG: ${{ steps.bump.outputs.tag }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore: release ${NEW_TAG}"
+          git tag "${NEW_TAG}"
+          git push origin HEAD:main
+          git push origin "${NEW_TAG}"
+
+  create-release:
+    name: Create GitHub Release
+    needs: bump-and-tag
+    runs-on: ubuntu-latest
+    steps:
       - name: Create release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          TAG: ${{ steps.meta.outputs.tag }}
-          VERSION: ${{ steps.meta.outputs.version }}
+          TAG: ${{ needs.bump-and-tag.outputs.tag }}
+          VERSION: ${{ needs.bump-and-tag.outputs.version }}
         run: |
-          if gh release view "${TAG}" --repo "${REPO}" >/dev/null 2>&1; then
-            echo "Release ${TAG} already exists; skipping create."
-            exit 0
-          fi
-
           gh release create "${TAG}" \
             --repo "${REPO}" \
             --title "Release ${TAG}" \
@@ -93,7 +122,7 @@ jobs:
 
   build-release:
     name: Build ${{ matrix.target }}
-    needs: create-release
+    needs: [bump-and-tag, create-release]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -109,7 +138,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
-          ref: ${{ needs.create-release.outputs.tag }}
+          ref: ${{ needs.bump-and-tag.outputs.tag }}
 
       - name: Install Linux build deps
         if: runner.os == 'Linux'
@@ -131,7 +160,7 @@ jobs:
       - name: Smoke test --version
         env:
           TARGET: ${{ matrix.target }}
-          VERSION: ${{ needs.create-release.outputs.version }}
+          VERSION: ${{ needs.bump-and-tag.outputs.version }}
         run: |
           out=$("./target/${TARGET}/release/cekanje" --version)
           echo "${out}"
@@ -140,7 +169,7 @@ jobs:
       - name: Create archive
         env:
           TARGET: ${{ matrix.target }}
-          VERSION: ${{ needs.create-release.outputs.version }}
+          VERSION: ${{ needs.bump-and-tag.outputs.version }}
         run: |
           archive="cekanje-${VERSION}-${TARGET}.tar.gz"
           tar -C "target/${TARGET}/release" -czf "${archive}" cekanje
@@ -151,12 +180,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          TAG: ${{ needs.create-release.outputs.tag }}
+          TAG: ${{ needs.bump-and-tag.outputs.tag }}
         run: gh release upload "${TAG}" --repo "${REPO}" "${ARCHIVE}" --clobber
 
   update-homebrew-formula:
     name: Update Homebrew Formula
-    needs: [create-release, build-release]
+    needs: [bump-and-tag, build-release]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -170,8 +199,8 @@ jobs:
         id: sha
         env:
           REPO: ${{ github.repository }}
-          TAG: ${{ needs.create-release.outputs.tag }}
-          VERSION: ${{ needs.create-release.outputs.version }}
+          TAG: ${{ needs.bump-and-tag.outputs.tag }}
+          VERSION: ${{ needs.bump-and-tag.outputs.version }}
         run: |
           base="https://github.com/${REPO}/releases/download/${TAG}"
 
@@ -186,8 +215,8 @@ jobs:
       - name: Regenerate Formula/cekanje.rb
         env:
           REPO: ${{ github.repository }}
-          TAG: ${{ needs.create-release.outputs.tag }}
-          VERSION: ${{ needs.create-release.outputs.version }}
+          TAG: ${{ needs.bump-and-tag.outputs.tag }}
+          VERSION: ${{ needs.bump-and-tag.outputs.version }}
           AARCH64_MAC_SHA: ${{ steps.sha.outputs.aarch64_mac }}
           X86_MAC_SHA: ${{ steps.sha.outputs.x86_mac }}
           X86_LINUX_SHA: ${{ steps.sha.outputs.x86_linux }}
@@ -231,7 +260,7 @@ jobs:
 
       - name: Commit and push
         env:
-          VERSION: ${{ needs.create-release.outputs.version }}
+          VERSION: ${{ needs.bump-and-tag.outputs.version }}
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -255,13 +284,13 @@ jobs:
 
   publish-crates:
     name: Publish to crates.io
-    needs: [create-release, build-release]
+    needs: [bump-and-tag, build-release]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
-          ref: ${{ needs.create-release.outputs.tag }}
+          ref: ${{ needs.bump-and-tag.outputs.tag }}
 
       - name: Install Linux build deps
         run: |
