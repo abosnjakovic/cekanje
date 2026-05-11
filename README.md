@@ -100,14 +100,14 @@ Daemon binds 127.0.0.1 only — no auth needed.
 Append to `~/.config/tmux/tmux.conf`:
 
 ```tmux
-set-hook -g session-created 'run-shell -b "cek serve --ensure"'
+set-hook -g session-created 'run-shell -b "cek serve --ensure --idle-secs 0"'
 set-hook -g pane-focus-in   'run-shell -b "cek visit #{pane_id}"'
 bind-key -n M-i run-shell 'cek menu'
 ```
 
 `cek menu` self-launches a borderless fullscreen `tmux display-popup` and re-execs itself inside it (signalled via `CEK_FULLSCREEN_HOST=1`), so the binding stays trivial. Requires tmux 3.3+ for the `-B` flag.
 
-Reload: `tmux source-file ~/.config/tmux/tmux.conf`. Then bootstrap once with `cek serve --ensure` (the `session-created` hook only fires for newly-opened tmux sessions).
+Reload: `tmux source-file ~/.config/tmux/tmux.conf`. Then bootstrap once with `cek serve --ensure --idle-secs 0` (the `session-created` hook only fires for newly-opened tmux sessions, so leaving the auto-idle-shutdown off avoids a dead port mid-session).
 
 If you keep a tmux status bar, you can also add `set -ag status-right '#(cek status) '` plus `set -g status-interval 5`.
 
@@ -135,6 +135,36 @@ Caveats:
 - Path encoding is naive (`-` ↔ `/`). cwds containing literal `-` round-trip ambiguously, but won't crash.
 - Disable with `--rebuild-window-secs 0`. Widen with e.g. `--rebuild-window-secs 3600` to restore everything from the last hour.
 
+## Hot-reload on binary upgrade
+
+A long-lived daemon inside tmux outlives most package upgrades. To avoid serving stale code after `brew upgrade cekanje`, `cargo install cekanje`, or a manual tarball swap, the running daemon fingerprints its own on-disk binary (dev/inode/mtime/size, following symlinks so Homebrew's `Cellar` chain is observed correctly) at startup, and re-checks the fingerprint after every `/hooks/event` request.
+
+When the fingerprint changes:
+
+1. A single-flight latch is claimed so concurrent hook events don't double-swap.
+2. axum is signalled to drain — in-flight requests have up to 3 seconds to finish.
+3. The process replaces its own image in place via `execve(2)`. The PID is preserved, so tmux's child relationship with the daemon survives. argv is replayed verbatim, so flags like `--idle-secs 0` carry across the swap.
+4. The new image rebinds 127.0.0.1:8731 (with a brief retry loop covering the kernel's port-release window) and rebuilds session state from `~/.claude/projects/` via the usual cold-start path.
+
+Typical end-to-end swap latency is under 200 ms; an in-flight Claude hook generally sees no disruption.
+
+Inspect what the running daemon thinks of itself:
+
+```bash
+curl -s 127.0.0.1:8731/admin/version
+# {"version":"0.1.3","startup_fp":{...},"current_fp":{...},"swap_in_flight":false}
+```
+
+`startup_fp` and `current_fp` differing means a swap is queued for the next hook event. Manual probe without waiting for Claude:
+
+```bash
+curl -s -X POST 127.0.0.1:8731/hooks/event \
+  -H 'content-type: application/json' \
+  -d '{"hook_event_name":"SessionStart","session_id":"manual-swap-probe"}'
+```
+
+If something prevents the swap (binary missing, permission error), the daemon logs the failure and keeps serving the old image — it never euthanises itself on a transient filesystem error.
+
 ## State machine
 
 | Event | New status | Notification |
@@ -150,8 +180,9 @@ Auto-clear (pane focused) means: if any attached tmux client's `client_pane` equ
 ## Files
 
 - `src/main.rs` — clap dispatch
-- `src/serve.rs` — axum app, event handlers, idle-shutdown task
+- `src/serve.rs` — axum app, event handlers, idle-shutdown task, hot-reload wiring
 - `src/state.rs` — Session / State types and transitions
+- `src/reload.rs` — binary fingerprint + in-place process-image swap
 - `src/tmux.rs` — `tmux` shell-out helpers (`is_pane_focused`, `switch_to_pane`)
 - `src/menu.rs` — fzf picker
 - `src/notify.rs` — `notify-rust` wrapper
