@@ -10,14 +10,47 @@ pub fn parse_socket(tmux_env: &str) -> String {
     tmux_env.split(',').next().unwrap_or(tmux_env).to_string()
 }
 
-/// Return active panes (one per attached client) on a given tmux server.
-pub fn active_panes(socket: Option<&str>) -> Vec<String> {
+fn base_cmd(socket: Option<&str>) -> Command {
     let mut cmd = Command::new("tmux");
     if let Some(s) = socket {
         cmd.arg("-S").arg(s);
     }
+    cmd
+}
+
+fn build_list_clients(socket: Option<&str>) -> Command {
+    let mut cmd = base_cmd(socket);
     cmd.args(["list-clients", "-F", "#{client_pane}"]);
-    match cmd.output() {
+    cmd
+}
+
+fn build_display_message(socket: Option<&str>, pane: &str, fmt: &str) -> Command {
+    let mut cmd = base_cmd(socket);
+    cmd.args(["display-message", "-p", "-t", pane, fmt]);
+    cmd
+}
+
+fn build_capture_pane(socket: Option<&str>, pane: &str, scrollback_lines: u32) -> Command {
+    let mut cmd = base_cmd(socket);
+    let scrollback = format!("-{scrollback_lines}");
+    cmd.args(["capture-pane", "-p", "-t", pane, "-S", &scrollback]);
+    cmd
+}
+
+fn build_list_panes(socket: Option<&str>) -> Command {
+    let mut cmd = base_cmd(socket);
+    cmd.args([
+        "list-panes",
+        "-a",
+        "-F",
+        "#{pane_id}\t#{pane_current_path}\t#{pane_current_command}",
+    ]);
+    cmd
+}
+
+/// Return active panes (one per attached client) on a given tmux server.
+pub fn active_panes(socket: Option<&str>) -> Vec<String> {
+    match build_list_clients(socket).output() {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
             .lines()
             .map(|s| s.trim().to_string())
@@ -41,12 +74,9 @@ pub fn switch_to_pane(socket: Option<&str>, pane: &str) -> Result<()> {
 }
 
 pub fn display_message(socket: Option<&str>, pane: &str, fmt: &str) -> Result<String> {
-    let mut cmd = Command::new("tmux");
-    if let Some(s) = socket {
-        cmd.arg("-S").arg(s);
-    }
-    cmd.args(["display-message", "-p", "-t", pane, fmt]);
-    let out = cmd.output().context("tmux display-message")?;
+    let out = build_display_message(socket, pane, fmt)
+        .output()
+        .context("tmux display-message")?;
     if !out.status.success() {
         bail!(
             "tmux display-message failed: {}",
@@ -60,13 +90,9 @@ pub fn display_message(socket: Option<&str>, pane: &str, fmt: &str) -> Result<St
 /// raw text. Errors are surfaced; callers may render an empty preview if the
 /// pane has gone away.
 pub fn capture_pane(socket: Option<&str>, pane: &str, scrollback_lines: u32) -> Result<String> {
-    let mut cmd = Command::new("tmux");
-    if let Some(s) = socket {
-        cmd.arg("-S").arg(s);
-    }
-    let scrollback = format!("-{scrollback_lines}");
-    cmd.args(["capture-pane", "-p", "-t", pane, "-S", &scrollback]);
-    let out = cmd.output().context("tmux capture-pane")?;
+    let out = build_capture_pane(socket, pane, scrollback_lines)
+        .output()
+        .context("tmux capture-pane")?;
     if !out.status.success() {
         bail!(
             "tmux capture-pane failed: {}",
@@ -88,17 +114,7 @@ pub fn pane_alive(socket: Option<&str>, pane: &str) -> bool {
 /// Only the pane's reported current command is matched; we cannot retrieve the
 /// session_id from the claude process itself, so disambiguation is the caller's job.
 pub fn list_claude_panes_by_cwd(socket: Option<&str>) -> HashMap<PathBuf, Vec<TmuxLocation>> {
-    let mut cmd = Command::new("tmux");
-    if let Some(s) = socket {
-        cmd.arg("-S").arg(s);
-    }
-    cmd.args([
-        "list-panes",
-        "-a",
-        "-F",
-        "#{pane_id}\t#{pane_current_path}\t#{pane_current_command}",
-    ]);
-    let Ok(out) = cmd.output() else {
+    let Ok(out) = build_list_panes(socket).output() else {
         return HashMap::new();
     };
     if !out.status.success() {
@@ -132,14 +148,99 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let mut cmd = Command::new("tmux");
-    if let Some(s) = socket {
-        cmd.arg("-S").arg(s);
-    }
+    let mut cmd = base_cmd(socket);
     cmd.args(args);
     let st = cmd.status().context("run tmux")?;
     if !st.success() {
         bail!("tmux exited with {st}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args_of(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn parse_socket_extracts_socket_from_full_tmux_env() {
+        assert_eq!(
+            parse_socket("/private/tmp/tmux-501/default,12345,0"),
+            "/private/tmp/tmux-501/default"
+        );
+    }
+
+    #[test]
+    fn parse_socket_returns_input_when_no_comma() {
+        assert_eq!(parse_socket("/tmp/sock"), "/tmp/sock");
+    }
+
+    #[test]
+    fn parse_socket_handles_empty_input() {
+        assert_eq!(parse_socket(""), "");
+    }
+
+    #[test]
+    fn base_cmd_targets_tmux_binary() {
+        let cmd = base_cmd(None);
+        assert_eq!(cmd.get_program(), "tmux");
+        assert!(args_of(&cmd).is_empty());
+    }
+
+    #[test]
+    fn base_cmd_prepends_dash_s_when_socket_given() {
+        let cmd = base_cmd(Some("/tmp/sock"));
+        assert_eq!(args_of(&cmd), vec!["-S", "/tmp/sock"]);
+    }
+
+    #[test]
+    fn build_list_clients_no_socket() {
+        let cmd = build_list_clients(None);
+        assert_eq!(args_of(&cmd), vec!["list-clients", "-F", "#{client_pane}"]);
+    }
+
+    #[test]
+    fn build_list_clients_with_socket() {
+        let cmd = build_list_clients(Some("/tmp/s"));
+        assert_eq!(
+            args_of(&cmd),
+            vec!["-S", "/tmp/s", "list-clients", "-F", "#{client_pane}"]
+        );
+    }
+
+    #[test]
+    fn build_display_message_passes_pane_and_format() {
+        let cmd = build_display_message(None, "%7", "#{pane_id}");
+        assert_eq!(
+            args_of(&cmd),
+            vec!["display-message", "-p", "-t", "%7", "#{pane_id}"]
+        );
+    }
+
+    #[test]
+    fn build_capture_pane_includes_negative_scrollback() {
+        let cmd = build_capture_pane(None, "%2", 100);
+        assert_eq!(
+            args_of(&cmd),
+            vec!["capture-pane", "-p", "-t", "%2", "-S", "-100"]
+        );
+    }
+
+    #[test]
+    fn build_list_panes_uses_tab_delimited_format() {
+        let cmd = build_list_panes(None);
+        let a = args_of(&cmd);
+        assert_eq!(a[0], "list-panes");
+        assert_eq!(a[1], "-a");
+        assert_eq!(a[2], "-F");
+        assert_eq!(
+            a[3],
+            "#{pane_id}\t#{pane_current_path}\t#{pane_current_command}"
+        );
+    }
 }

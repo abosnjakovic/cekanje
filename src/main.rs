@@ -133,3 +133,128 @@ fn spawn_detached(port: u16, idle_secs: u64, rebuild_window_secs: u64) -> anyhow
         .spawn()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).expect("parse")
+    }
+
+    #[test]
+    fn serve_defaults() {
+        let cli = parse(&["cek", "serve"]);
+        match cli.command {
+            Cmd::Serve {
+                port,
+                ensure,
+                idle_secs,
+                rebuild_window_secs,
+            } => {
+                assert_eq!(port, 8731);
+                assert!(!ensure);
+                assert_eq!(idle_secs, 1800);
+                assert_eq!(rebuild_window_secs, 300);
+            }
+            _ => panic!("expected Serve"),
+        }
+    }
+
+    #[test]
+    fn serve_with_all_flags() {
+        let cli = parse(&[
+            "cek",
+            "serve",
+            "--port",
+            "9000",
+            "--ensure",
+            "--idle-secs",
+            "0",
+            "--rebuild-window-secs",
+            "0",
+        ]);
+        match cli.command {
+            Cmd::Serve {
+                port,
+                ensure,
+                idle_secs,
+                rebuild_window_secs,
+            } => {
+                assert_eq!(port, 9000);
+                assert!(ensure);
+                assert_eq!(idle_secs, 0);
+                assert_eq!(rebuild_window_secs, 0);
+            }
+            _ => panic!("expected Serve"),
+        }
+    }
+
+    #[test]
+    fn status_subcommand_with_custom_port() {
+        let cli = parse(&["cek", "status", "--port", "9000"]);
+        match cli.command {
+            Cmd::Status { port } => assert_eq!(port, 9000),
+            _ => panic!("expected Status"),
+        }
+    }
+
+    #[test]
+    fn list_subcommand_uses_default_port() {
+        let cli = parse(&["cek", "list"]);
+        match cli.command {
+            Cmd::List { port } => assert_eq!(port, 8731),
+            _ => panic!("expected List"),
+        }
+    }
+
+    #[test]
+    fn visit_requires_pane_argument() {
+        let cli = parse(&["cek", "visit", "%42"]);
+        match cli.command {
+            Cmd::Visit { pane, port } => {
+                assert_eq!(pane, "%42");
+                assert_eq!(port, 8731);
+            }
+            _ => panic!("expected Visit"),
+        }
+    }
+
+    #[test]
+    fn menu_subcommand_parses() {
+        let cli = parse(&["cek", "menu"]);
+        assert!(matches!(cli.command, Cmd::Menu { port: 8731 }));
+    }
+
+    #[test]
+    fn preview_takes_session_id() {
+        let cli = parse(&["cek", "preview", "abc-123"]);
+        match cli.command {
+            Cmd::Preview { session_id, port } => {
+                assert_eq!(session_id, "abc-123");
+                assert_eq!(port, 8731);
+            }
+            _ => panic!("expected Preview"),
+        }
+    }
+
+    #[test]
+    fn missing_subcommand_errors() {
+        assert!(Cli::try_parse_from(["cek"]).is_err());
+    }
+
+    #[test]
+    fn visit_without_pane_errors() {
+        assert!(Cli::try_parse_from(["cek", "visit"]).is_err());
+    }
+
+    #[test]
+    fn preview_without_session_id_errors() {
+        assert!(Cli::try_parse_from(["cek", "preview"]).is_err());
+    }
+
+    #[test]
+    fn unknown_subcommand_errors() {
+        assert!(Cli::try_parse_from(["cek", "bogus"]).is_err());
+    }
+}
