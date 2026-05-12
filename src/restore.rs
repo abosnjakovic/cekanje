@@ -69,19 +69,7 @@ fn load_persisted(shared: &Shared, persist_path: Option<&Path>) -> usize {
 }
 
 fn validate_panes(shared: &Shared) -> usize {
-    let mut dropped = 0;
-    let mut s = shared.write();
-    for sess in s.sessions.values_mut() {
-        let Some(loc) = &sess.tmux else { continue };
-        if !tmux::pane_alive(loc.socket.as_deref(), &loc.pane) {
-            sess.tmux = None;
-            dropped += 1;
-        }
-    }
-    if dropped > 0 {
-        s.rebuild_pane_index();
-    }
-    dropped
+    shared.write().prune_dead_panes()
 }
 
 fn bind_unbound_via_heuristic(shared: &Shared) -> usize {

@@ -296,7 +296,11 @@ async fn status(AxumState(shared): AxumState<Shared>) -> String {
 }
 
 async fn list(AxumState(shared): AxumState<Shared>) -> impl IntoResponse {
+    let dropped = shared.write().prune_dead_panes();
     let snapshot = shared.read().snapshot();
+    if dropped > 0 {
+        persist_now(&shared);
+    }
     Json(snapshot)
 }
 
