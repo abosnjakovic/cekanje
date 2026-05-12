@@ -1,3 +1,4 @@
+use crate::tmux;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -188,6 +189,25 @@ impl State {
                 self.by_pane.insert(loc.pane.clone(), s.session_id.clone());
             }
         }
+    }
+
+    /// Drop `tmux` bindings whose pane no longer exists on the tmux server.
+    /// Returns the number of bindings dropped. Sessions themselves are kept
+    /// (they retain their cwd/transcript record); only the dead binding is
+    /// cleared so consumers can filter the orphan out.
+    pub fn prune_dead_panes(&mut self) -> usize {
+        let mut dropped = 0;
+        for sess in self.sessions.values_mut() {
+            let Some(loc) = &sess.tmux else { continue };
+            if !tmux::pane_alive(loc.socket.as_deref(), &loc.pane) {
+                sess.tmux = None;
+                dropped += 1;
+            }
+        }
+        if dropped > 0 {
+            self.rebuild_pane_index();
+        }
+        dropped
     }
 
     pub fn snapshot(&self) -> Vec<Session> {
